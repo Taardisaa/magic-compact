@@ -9,7 +9,7 @@ import {
   injectTrimStatsNotice,
   recordPruningStats,
 } from "./compact/session";
-import { countSessionTokens } from "./stats/tokenize";
+import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
 
 export const TRIM_SUCCESS = "Magic trimming successful.";
 export const TRIM_NOOP = "No eligible tool calls need trimming.";
@@ -31,7 +31,9 @@ export async function executeMagicTrim(
       getCompactionCount(sourceSession),
     );
 
-    const beforeTokens = await countSessionTokens(v2, sessionID);
+    const beforeTokens =
+      (await getProviderTokens(v2, sessionID))
+      ?? (await countSessionTokens(v2, sessionID));
     const trimmedToolCalls = await trimToolParts(
       { v2, sessionID },
       plan.trimmedTurns,

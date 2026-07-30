@@ -42,7 +42,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`Core.md`](
 3. Preserve the `N` most recent assistant turns.
 4. Load the source session and fork it as a backup.
 5. Copy omission and stats caches to the backup.
-6. Measure pre-trim tokens using local counting.
+6. Measure pre-trim tokens using provider tokens when available, otherwise local counting.
 7. Apply the normal tool input and output trimming rules to older turns.
 8. Mark processed completed tool states with `state.metadata.magicCompact.trimmed === true`.
 9. Stop with a no-op toast if no tool states were processed.
