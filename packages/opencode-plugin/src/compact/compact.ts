@@ -2,7 +2,7 @@ import type { Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
 import { summaryMetadata, summaryPartID } from "./constants";
 import { createCompactionPlan, type Turn } from "./plan";
-import { buildCompactionPrompt } from "./template";
+import { buildCompactionPrompt, buildSummaryRepairPrompt } from "./template";
 
 export type CompactSessionResult = {
   summarizedTurns: Turn[];
@@ -78,34 +78,55 @@ async function generateSummaries(
   nextTurn: Turn | null,
 ): Promise<string[]> {
   const variant = sourceSession.model?.variant;
-  const response = unwrap(
-    await v2.session.prompt({
-      sessionID,
-      ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
-      ...(sourceSession.model
-        ? {
-            model: {
-              providerID: sourceSession.model.providerID,
-              modelID: sourceSession.model.id,
-            },
-          }
-        : {}),
-      ...(variant && variant !== "default" ? { variant } : {}),
-      parts: [
-        {
-          type: "text",
-          text: buildCompactionPrompt(turns, nextTurn),
-        },
-      ],
-    }),
-  );
+  const prompt = async (text: string): Promise<string> => {
+    const response = unwrap(
+      await v2.session.prompt({
+        sessionID,
+        ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
+        ...(sourceSession.model
+          ? {
+              model: {
+                providerID: sourceSession.model.providerID,
+                modelID: sourceSession.model.id,
+              },
+            }
+          : {}),
+        ...(variant && variant !== "default" ? { variant } : {}),
+        parts: [
+          {
+            type: "text",
+            text,
+          },
+        ],
+      }),
+    );
 
-  const textResponse = response.parts
-    .filter((part): part is TextPart => part.type === "text")
-    .map(part => part.text)
-    .join("\n");
+    return response.parts
+      .filter((part): part is TextPart => part.type === "text")
+      .map(part => part.text)
+      .join("\n");
+  };
 
-  return parseSummaries(textResponse, turns.length);
+  const firstResponse = await prompt(buildCompactionPrompt(turns, nextTurn));
+  try {
+    return parseSummaries(firstResponse, turns.length);
+  } catch (firstError) {
+    const repairResponse = await prompt(
+      buildSummaryRepairPrompt(turns, nextTurn),
+    );
+    try {
+      return parseSummaries(repairResponse, turns.length);
+    } catch (repairError) {
+      throw new Error(
+        `Summary XML parsing failed after one repair attempt. Initial failure: ${errorMessage(firstError)} Repair failure: ${errorMessage(repairError)}`,
+        { cause: repairError },
+      );
+    }
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function parseSummaries(responseText: string, expectedCount: number): string[] {

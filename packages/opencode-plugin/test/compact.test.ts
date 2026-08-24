@@ -60,38 +60,87 @@ describe("magic compact", () => {
     expect(requests.prompts[0]).not.toHaveProperty("model");
     expect(requests.prompts[0]).not.toHaveProperty("variant");
   });
+
+  test("repairs one malformed summary response in the ephemeral session", async () => {
+    const requests = await runCompaction(
+      {
+        ...session("source"),
+        agent: "plan",
+        model: {
+          providerID: "qwen",
+          id: "qwen-model",
+          variant: "thinking",
+        },
+      },
+      [
+        "I summarized the request but forgot the XML wrapper.",
+        "<summary><user>Request</user><assistant>Completed the request.</assistant></summary>",
+      ],
+    );
+
+    expect(requests.prompts).toHaveLength(2);
+    expect(requests.prompts[1]).toMatchObject({
+      sessionID: "ephemeral",
+      agent: "plan",
+      model: {
+        providerID: "qwen",
+        modelID: "qwen-model",
+      },
+      variant: "thinking",
+    });
+    expect(promptText(requests.prompts[1]!)).toContain(
+      "Repair the Previous Summary Response",
+    );
+    expect(requests.deletes).toEqual(["ephemeral"]);
+  });
+
+  test("stops after one unsuccessful repair and deletes the ephemeral session", async () => {
+    const requests = requestLog();
+
+    await expect(
+      runCompaction(session("source"), ["not xml", "still not xml"], requests),
+    ).rejects.toThrow("Summary XML parsing failed after one repair attempt.");
+
+    expect(requests.prompts).toHaveLength(2);
+    expect(requests.deletes).toEqual(["ephemeral"]);
+  });
 });
 
-async function runCompaction(sourceSession: Session): Promise<{
+type RequestLog = {
   prompts: Record<string, unknown>[];
   updates: Record<string, unknown>[];
-}> {
-  const prompts: Record<string, unknown>[] = [];
-  const updates: Record<string, unknown>[] = [];
+  deletes: string[];
+};
+
+async function runCompaction(
+  sourceSession: Session,
+  responses = [
+    "<summary><user>Request</user><assistant>Completed the request.</assistant></summary>",
+  ],
+  requests = requestLog(),
+): Promise<RequestLog> {
+  let responseIndex = 0;
   const v2 = {
     session: {
       messages: async () => ({ data: compactableMessages() }),
       fork: async () => ({ data: session("ephemeral") }),
       update: async (request: Record<string, unknown>) => {
-        updates.push(request);
+        requests.updates.push(request);
         return { data: session("ephemeral") };
       },
       prompt: async (request: Record<string, unknown>) => {
-        prompts.push(request);
+        requests.prompts.push(request);
+        const text = responses[responseIndex++] ?? responses.at(-1) ?? "";
         return {
           data: {
-            parts: [
-              textPart(
-                "response",
-                "ephemeral",
-                "response",
-                "<summary><user>Request</user><assistant>Completed the request.</assistant></summary>",
-              ),
-            ],
+            parts: [textPart("response", "ephemeral", "response", text)],
           },
         };
       },
-      delete: async () => ({ data: true }),
+      delete: async ({ sessionID }: { sessionID: string }) => {
+        requests.deletes.push(sessionID);
+        return { data: true };
+      },
     },
     part: {
       update: async ({ part }: { part: TextPart }) => ({ data: part }),
@@ -99,7 +148,16 @@ async function runCompaction(sourceSession: Session): Promise<{
   } as unknown as V2Client;
 
   await compactSession(v2, sourceSession, "source", 0);
-  return { prompts, updates };
+  return requests;
+}
+
+function requestLog(): RequestLog {
+  return { prompts: [], updates: [], deletes: [] };
+}
+
+function promptText(request: Record<string, unknown>): string {
+  const parts = request["parts"] as { type: string; text: string }[];
+  return parts[0]?.text ?? "";
 }
 
 function compactableMessages(): MessageWithParts[] {

@@ -25,15 +25,17 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
 11. Send the XML summary prompt in the ephemeral session.
 12. Parse per-turn summaries.
-13. Delete the ephemeral session in cleanup.
-14. Delete the progress message in cleanup.
-15. Upsert deterministic summary text parts onto the first assistant message in each summarized turn.
-16. Inject the post-compaction boundary notice.
-17. Reload summarized turns, then prune summarized turns.
-18. Update current session metadata with `compactionCount`.
-19. Measure post-compaction tokens.
-20. Update stats and inject an ignored stats notice.
-21. Show a success toast.
+13. If XML parsing fails, send one strict XML repair prompt in the same ephemeral session and parse the repaired response.
+14. Abort if the single repair attempt also fails.
+15. Delete the ephemeral session in cleanup.
+16. Delete the progress message in cleanup.
+17. Upsert deterministic summary text parts onto the first assistant message in each summarized turn.
+18. Inject the post-compaction boundary notice.
+19. Reload summarized turns, then prune summarized turns.
+20. Update current session metadata with `compactionCount`.
+21. Measure post-compaction tokens.
+22. Update stats and inject an ignored stats notice.
+23. Show a success toast.
 
 ## Trim Flow (Experimental)
 
@@ -90,6 +92,8 @@ Known issues: We do not check for noops.
 - The XML prompt includes only the turns being summarized and, when needed, the next user turn as the boundary marker.
 - User text in the prompt excludes synthetic and ignored text and is truncated to the first line or first 300 characters, whichever is shorter.
 - The generated XML must contain one `<assistant>` summary for each summarized turn.
+- A malformed first response is corrected with at most one additional prompt in the same ephemeral session. The repair preserves the source model, agent, variant, provider, and data boundary.
+- A malformed repair response aborts compaction and follows normal recovery behavior.
 - Each summary is written as a text part on the first assistant message in the summarized turn.
 - Summary parts use deterministic IDs: `prt_-magic_summary_${messageID}`.
 - Summary parts are marked with `metadata.magicCompact.summary === true`.
