@@ -67,6 +67,28 @@ describe("magic compact", () => {
     expect(requests.prompts[0]).not.toHaveProperty("variant");
   });
 
+  test("derives missing session model settings from the latest assistant turn", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 100_000, output: 4_000 };
+    const messages = compactableMessages();
+    const assistant = messages[1]?.info;
+    if (assistant?.role === "assistant") {
+      assistant.agent = "build";
+      assistant.providerID = "provider";
+      assistant.modelID = "model";
+      assistant.variant = "fast";
+    }
+
+    await runCompaction(session("source"), undefined, requests, messages);
+
+    expect(requests.prompts[0]).toMatchObject({
+      sessionID: "ephemeral",
+      agent: "build",
+      model: { providerID: "provider", modelID: "model" },
+      variant: "fast",
+    });
+  });
+
   test("repairs one malformed summary response in a fresh minimal session", async () => {
     const requests = await runCompaction(
       {
@@ -164,6 +186,113 @@ describe("magic compact", () => {
     }
   });
 
+  test("splits an oversized request into complete turn batches and carries prior summaries", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 4_000, output: 500 };
+    const source = {
+      ...session("source"),
+      model: { providerID: "provider", id: "model" },
+    };
+    const messages = compactableTurnMessages(2, "word ".repeat(1_800));
+    const responses = [
+      "<summary><user>Request 1</user><assistant>Summary for turn one.</assistant></summary>",
+      "<summary><user>Request 2</user><assistant>Summary for turn two.</assistant></summary>",
+    ];
+
+    await runCompaction(source, responses, requests, messages);
+
+    expect(requests.prompts.map(request => request["sessionID"])).toEqual([
+      "batch-1",
+      "batch-2",
+    ]);
+    expect(promptText(requests.prompts[1]!)).toContain("Summary for turn one.");
+    expect(requests.deletes).toEqual(["batch-1", "batch-2", "ephemeral"]);
+    const injectedSummaries = requests.partUpdates
+      .map(request => request["part"] as TextPart)
+      .filter(part => part.metadata?.["magicCompact"] !== undefined)
+      .map(part => part.text);
+    expect(injectedSummaries).toEqual([
+      "Summary for turn one.",
+      "Summary for turn two.",
+    ]);
+  });
+
+  test("recursively splits a batch when the provider reports context overflow", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 4_000, output: 500 };
+    const source = {
+      ...session("source"),
+      model: { providerID: "provider", id: "model" },
+    };
+    const messages = compactableTurnMessages(2, "short assistant result");
+    const firstAssistant = messages[1]?.info;
+    if (firstAssistant?.role === "assistant") {
+      firstAssistant.tokens.input = 3_500;
+    }
+
+    await runCompaction(
+      source,
+      [
+        {
+          error: {
+            name: "ContextOverflowError",
+            data: { message: "batch exceeded provider context" },
+          },
+        },
+        "<summary><user>Request 1</user><assistant>Recovered summary one.</assistant></summary>",
+        "<summary><user>Request 2</user><assistant>Recovered summary two.</assistant></summary>",
+      ],
+      requests,
+      messages,
+    );
+
+    expect(requests.prompts.map(request => request["sessionID"])).toEqual([
+      "batch-1",
+      "batch-2",
+      "batch-3",
+    ]);
+    expect(promptText(requests.prompts[2]!)).toContain(
+      "Recovered summary one.",
+    );
+    expect(requests.deletes).toEqual([
+      "batch-1",
+      "batch-2",
+      "batch-3",
+      "ephemeral",
+    ]);
+  });
+
+  test("does not inject partial summaries when a later batch fails", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 4_000, output: 500 };
+    const source = {
+      ...session("source"),
+      model: { providerID: "provider", id: "model" },
+    };
+    const messages = compactableTurnMessages(2, "word ".repeat(1_800));
+
+    await expect(
+      runCompaction(
+        source,
+        [
+          "<summary><user>Request 1</user><assistant>Summary one.</assistant></summary>",
+          "malformed second batch",
+          "still malformed",
+        ],
+        requests,
+        messages,
+      ),
+    ).rejects.toThrow("Summary XML parsing failed after one repair attempt");
+
+    expect(requests.partUpdates).toHaveLength(0);
+    expect(requests.deletes).toEqual([
+      "batch-1",
+      "batch-2",
+      "repair",
+      "ephemeral",
+    ]);
+  });
+
   test("fails early with an actionable error when the pruned request still cannot fit", async () => {
     const requests = requestLog();
     requests.modelLimit = { context: 100, output: 50 };
@@ -173,7 +302,7 @@ describe("magic compact", () => {
     };
 
     await expect(runCompaction(source, undefined, requests)).rejects.toThrow(
-      "still cannot fit the summary request",
+      "cannot fit assistant turn 1 into an isolated summary batch",
     );
 
     expect(requests.prompts).toHaveLength(0);
@@ -188,28 +317,37 @@ type RequestLog = {
   deletes: string[];
   partUpdates: Record<string, unknown>[];
   modelLimit?: { context: number; output: number };
-  providerError?: {
-    name: "ContextOverflowError";
-    data: { message: string };
-  };
+  providerError?: MockProviderError;
 };
+
+type MockProviderError = {
+  name: "ContextOverflowError";
+  data: { message: string };
+};
+
+type MockResponse = string | { error: MockProviderError };
 
 async function runCompaction(
   sourceSession: Session,
-  responses: string[] = [
+  responses: MockResponse[] = [
     "<summary><user>Request</user><assistant>Completed the request.</assistant></summary>",
   ],
   requests = requestLog(),
   messages = compactableMessages(),
 ): Promise<RequestLog> {
   let responseIndex = 0;
+  let batchIndex = 0;
   const v2 = {
     session: {
       messages: async () => ({ data: messages }),
       fork: async () => ({ data: session("ephemeral") }),
       create: async (request: Record<string, unknown>) => {
         requests.creates.push(request);
-        return { data: session("repair") };
+        const title = String(request["title"] ?? "");
+        const id = title.startsWith("[TEMP SUMMARY BATCH")
+          ? `batch-${++batchIndex}`
+          : "repair";
+        return { data: session(id) };
       },
       update: async (request: Record<string, unknown>) => {
         requests.updates.push(request);
@@ -217,10 +355,16 @@ async function runCompaction(
       },
       prompt: async (request: Record<string, unknown>) => {
         requests.prompts.push(request);
-        const text = responses[responseIndex++] ?? responses.at(-1) ?? "";
+        const mockResponse =
+          responses[responseIndex++] ?? responses.at(-1) ?? "";
+        const text = typeof mockResponse === "string" ? mockResponse : "";
+        const error =
+          typeof mockResponse === "string"
+            ? requests.providerError
+            : mockResponse.error;
         return {
           data: {
-            info: { error: requests.providerError },
+            info: { error },
             parts: [textPart("response", "ephemeral", "response", text)],
           },
         };
@@ -282,6 +426,31 @@ function compactableMessages(assistantParts: Part[] = []): MessageWithParts[] {
     ]),
     message("assistant", "assistant", assistantParts),
   ];
+}
+
+function compactableTurnMessages(
+  count: number,
+  assistantText: string,
+): MessageWithParts[] {
+  const messages: MessageWithParts[] = [];
+  for (let index = 1; index <= count; index++) {
+    const userID = `user-${index}`;
+    const assistantID = `assistant-${index}`;
+    messages.push(
+      message(userID, "user", [
+        textPart(`user-text-${index}`, "source", userID, `Request ${index}`),
+      ]),
+      message(assistantID, "assistant", [
+        textPart(
+          `assistant-text-${index}`,
+          "source",
+          assistantID,
+          assistantText,
+        ),
+      ]),
+    );
+  }
+  return messages;
 }
 
 function message(

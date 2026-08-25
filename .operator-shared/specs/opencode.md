@@ -24,22 +24,26 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 9. Insert an ignored no-reply progress message.
 10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
 11. In the ephemeral fork only, trim large completed tool inputs and outputs without writing omission-cache records.
-12. When model limits are available, estimate the pruned request size and abort with an actionable context-budget error if the request still cannot fit.
-13. Send the XML summary prompt in the ephemeral session.
-14. Abort immediately on a provider error or empty text response; do not misclassify it as malformed XML.
-15. Parse per-turn summaries.
-16. If a non-empty response has malformed XML, create a fresh, non-forked repair session containing only the malformed response and strict XML template.
-17. Send at most one repair request, parse it, and delete the repair session in cleanup.
-18. Abort if the single repair attempt also fails.
-19. Delete the ephemeral session in cleanup.
-20. Delete the progress message in cleanup.
-21. Upsert deterministic summary text parts onto the first assistant message in each summarized turn.
-22. Inject the post-compaction boundary notice.
-23. Reload summarized turns, then prune summarized turns.
-24. Update current session metadata with `compactionCount`.
-25. Measure post-compaction tokens.
-26. Update stats and inject an ignored stats notice.
-27. Show a success toast.
+12. When model limits are available, estimate the pruned request size.
+13. If the one-shot request fits, send the XML summary prompt in the ephemeral session.
+14. If it does not fit, dynamically group complete turns into safe batches and summarize each batch in a fresh, non-forked temporary session.
+15. Carry the two most recent summaries into the next batch as compact cross-batch context.
+16. If a batch receives a provider context-overflow error, recursively split it at a turn boundary and retry each half.
+17. Abort with an actionable error if one isolated turn still cannot fit.
+18. Abort immediately on other provider errors; do not misclassify them as malformed XML.
+19. Parse and accumulate per-turn summaries without mutating the source session.
+20. If a non-empty response has malformed XML, create a fresh, non-forked repair session containing only the malformed response and strict XML template.
+21. Send at most one repair request, parse it, and delete the repair session in cleanup.
+22. Abort if the single repair attempt also fails.
+23. Delete every batch, repair, and ephemeral session in cleanup.
+24. Delete the progress message in cleanup.
+25. Only after every summary succeeds, upsert deterministic summary text parts onto the first assistant message in each summarized turn.
+26. Inject the post-compaction boundary notice.
+27. Reload summarized turns, then prune summarized turns.
+28. Update current session metadata with `compactionCount`.
+29. Measure post-compaction tokens.
+30. Update stats and inject an ignored stats notice.
+31. Show a success toast.
 
 ## Trim Flow (Experimental)
 
@@ -92,14 +96,19 @@ Known issues: We do not check for noops.
 - Summaries are generated in an ephemeral session so the prompt and assistant stream stay out of the main session.
 - The ephemeral session is a fork of the source session: the summarizer needs the full conversation in context to summarize assistant turns faithfully.
 - Before summarization, the ephemeral fork applies the normal size thresholds to large completed tool I/O. The source and backup remain unchanged, and temporary omissions are not persisted because the fork is deleted.
-- The plugin uses locally estimated tokens plus model limits to reject summary requests that cannot fit even after temporary trimming. If metadata or estimation is unavailable, the provider remains the final authority.
+- The plugin uses locally estimated tokens plus model limits to choose between one-shot and batched summarization. If metadata or estimation is unavailable, the provider remains the final authority.
 - The model and prompt prefix must remain unchanged for cache reuse: the ephemeral request should use the same model, agent-controlled system prompt, and tool set as the source session.
+- If the session record does not persist a model or agent selection, the plugin derives them from the latest eligible assistant message so budgeting and fresh batch sessions still use the active provider/model.
 - The XML prompt is built from the OpenCode template.
 - The XML prompt includes only the turns being summarized and, when needed, the next user turn as the boundary marker.
 - User text in the prompt excludes synthetic and ignored text and is truncated to the first line or first 300 characters, whichever is shorter.
 - The generated XML must contain one `<assistant>` summary for each summarized turn.
 - Provider errors and empty responses abort without an XML retry.
 - A malformed non-empty first response is corrected with at most one additional prompt in a fresh, non-forked repair session. The repair prompt contains only the malformed output and required template while preserving the source model, agent, variant, provider, and data boundary.
+- Batch prompts contain a JSON projection of only their target turns from the already-trimmed ephemeral fork. Transcript content is explicitly treated as inert data.
+- Batches preserve complete turn boundaries, run sequentially, and carry at most the two most recent summaries forward as context.
+- Batch results are accumulated in memory and injected into the source only after every batch has produced the expected number of summaries.
+- Context-overflow failures recursively bisect multi-turn batches. A single oversized turn aborts safely and recommends OpenCode's native `/compact`.
 - A malformed repair response aborts compaction and follows normal recovery behavior.
 - Each summary is written as a text part on the first assistant message in the summarized turn.
 - Summary parts use deterministic IDs: `prt_-magic_summary_${messageID}`.

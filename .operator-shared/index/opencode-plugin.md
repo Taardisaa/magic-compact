@@ -32,7 +32,7 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 #### `src/compact/` — Compaction core
 
 - `plan.ts` — Turn model and `CompactionPlan` / `TrimPlan` planning
-- `compact.ts` — `compactSession` driver, temporary-fork budget guard, isolated XML repair, and `CompactSessionResult`
+- `compact.ts` — `compactSession` driver, temporary-fork budget guard, dynamic turn batching, recursive overflow splitting, isolated XML repair, and `CompactSessionResult`
 - `prune.ts` — `pruneSummarizedTurns`, persistent `trimToolParts`, and non-persistent temporary-fork trimming
 - `session.ts` — Backup create/apply, metadata, progress-notice injection
 - `template.ts` — Compaction prompt builder (`buildCompactionPrompt`)

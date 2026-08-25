@@ -3,10 +3,28 @@ import { unwrap, type V2Client } from "../api";
 import { summaryMetadata, summaryPartID } from "./constants";
 import { createCompactionPlan, createTrimPlan, type Turn } from "./plan";
 import { trimToolPartsForSummary } from "./prune";
-import { buildCompactionPrompt, buildSummaryRepairPrompt } from "./template";
+import {
+  buildBatchCompactionPrompt,
+  buildCompactionPrompt,
+  buildSummaryRepairPrompt,
+} from "./template";
 import { countSessionTokens, countTextTokens } from "../stats/tokenize";
 
 const SUMMARY_OUTPUT_RESERVE_CAP = 32_768;
+const BATCH_CONTEXT_FRACTION = 0.7;
+const PRIOR_BATCH_SUMMARY_COUNT = 2;
+
+type SummaryBudget = {
+  context: number;
+  reservedOutput: number;
+  maxPromptTokens: number;
+  batchPromptLimit: number;
+};
+
+type SummaryBatch = {
+  start: number;
+  end: number;
+};
 
 export type CompactSessionResult = {
   summarizedTurns: Turn[];
@@ -25,6 +43,7 @@ export async function compactSession(
     session,
     plan.summarizedTurns,
     plan.nextTurn,
+    keepTurns,
   );
 
   await injectSummaries(v2, sessionID, plan.summarizedTurns, summaries);
@@ -40,6 +59,7 @@ async function generateSummariesInEphemeralSession(
   session: Session,
   turns: Turn[],
   nextTurn: Turn | null,
+  keepTurns: number,
 ): Promise<string[]> {
   // Fork the source session so the summarizer sees the full conversation it
   // is asked to summarize. A freshly created session has no history: the
@@ -67,12 +87,29 @@ async function generateSummariesInEphemeralSession(
       temporaryTrimPlan.trimmedTurns,
     );
 
+    const temporarySummaryPlan = await createCompactionPlan(
+      v2,
+      compactionSession.id,
+      keepTurns,
+    );
+    if (temporarySummaryPlan.summarizedTurns.length !== turns.length) {
+      throw new Error(
+        "Temporary summary fork no longer matches the source compaction plan.",
+      );
+    }
+
+    const summarySession = resolveSummarySession(
+      session,
+      temporarySummaryPlan.summarizedTurns,
+    );
+
     return await generateSummaries(
       v2,
       compactionSession.id,
-      session,
+      summarySession,
       turns,
       nextTurn,
+      temporarySummaryPlan.summarizedTurns,
     );
   } finally {
     unwrap(
@@ -83,12 +120,54 @@ async function generateSummariesInEphemeralSession(
   }
 }
 
+function resolveSummarySession(session: Session, turns: Turn[]): Session {
+  if (session.model && session.agent) {
+    return session;
+  }
+
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex--) {
+    const assistants = turns[turnIndex]?.assistants ?? [];
+    for (
+      let assistantIndex = assistants.length - 1;
+      assistantIndex >= 0;
+      assistantIndex--
+    ) {
+      const info = assistants[assistantIndex]?.info;
+      if (info?.role !== "assistant") {
+        continue;
+      }
+      const derivedAgent = info.agent || undefined;
+      const derivedModel =
+        info.providerID && info.modelID
+          ? {
+              providerID: info.providerID,
+              id: info.modelID,
+              ...(info.variant ? { variant: info.variant } : {}),
+            }
+          : undefined;
+      if (
+        (!derivedAgent || session.agent)
+        && (!derivedModel || session.model)
+      ) {
+        continue;
+      }
+      return {
+        ...session,
+        ...(session.agent || !derivedAgent ? {} : { agent: derivedAgent }),
+        ...(session.model ? {} : derivedModel ? { model: derivedModel } : {}),
+      };
+    }
+  }
+  return session;
+}
+
 async function generateSummaries(
   v2: V2Client,
   sessionID: string,
   sourceSession: Session,
   turns: Turn[],
   nextTurn: Turn | null,
+  transcriptTurns: Turn[],
 ): Promise<string[]> {
   const variant = sourceSession.model?.variant;
   const prompt = async (
@@ -118,7 +197,7 @@ async function generateSummaries(
     );
 
     if (response.info.error) {
-      throw new Error(formatProviderError(response.info.error));
+      throw new SummaryProviderError(response.info.error);
     }
 
     return response.parts
@@ -128,27 +207,296 @@ async function generateSummaries(
   };
 
   const compactionPrompt = buildCompactionPrompt(turns, nextTurn);
-  await assertSummaryRequestFits(
+  const budget = await getSummaryBudget(v2, sourceSession);
+  const fullRequestFits = await summaryRequestFits(
     v2,
     sessionID,
-    sourceSession,
     compactionPrompt,
+    budget,
   );
 
-  const firstResponse = await prompt(sessionID, compactionPrompt);
+  if (budget && fullRequestFits === false) {
+    return generateSummariesInBatches(
+      v2,
+      sourceSession,
+      turns,
+      nextTurn,
+      transcriptTurns,
+      budget,
+      prompt,
+    );
+  }
+
+  let firstResponse: string;
+  try {
+    firstResponse = await prompt(sessionID, compactionPrompt);
+  } catch (error) {
+    if (budget && isContextOverflow(error) && turns.length > 1) {
+      return generateSummariesInBatches(
+        v2,
+        sourceSession,
+        turns,
+        nextTurn,
+        transcriptTurns,
+        budget,
+        prompt,
+      );
+    }
+    throw error;
+  }
   if (!firstResponse.trim()) {
+    if (budget && turns.length > 1) {
+      return generateSummariesInBatches(
+        v2,
+        sourceSession,
+        turns,
+        nextTurn,
+        transcriptTurns,
+        budget,
+        prompt,
+      );
+    }
     throw new Error(
       "Summary model returned no text. The provider likely rejected or aborted the request before XML generation.",
     );
   }
 
+  return parseOrRepairSummaries(
+    v2,
+    sourceSession,
+    turns,
+    nextTurn,
+    firstResponse,
+    prompt,
+  );
+}
+
+async function generateSummariesInBatches(
+  v2: V2Client,
+  sourceSession: Session,
+  turns: Turn[],
+  nextTurn: Turn | null,
+  transcriptTurns: Turn[],
+  budget: SummaryBudget,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string[]> {
+  const batches = planSummaryBatches(
+    turns,
+    nextTurn,
+    transcriptTurns,
+    budget.batchPromptLimit,
+  );
+  const summaries: string[] = [];
+
+  for (const batch of batches) {
+    const batchSummaries = await summarizeBatchRange(
+      v2,
+      sourceSession,
+      turns,
+      nextTurn,
+      transcriptTurns,
+      batch.start,
+      batch.end,
+      tail(summaries, PRIOR_BATCH_SUMMARY_COUNT),
+      budget,
+      prompt,
+    );
+    summaries.push(...batchSummaries);
+  }
+
+  if (summaries.length !== turns.length) {
+    throw new Error(
+      `Batched summary count mismatch: expected ${turns.length}, received ${summaries.length}.`,
+    );
+  }
+  return summaries;
+}
+
+function planSummaryBatches(
+  turns: Turn[],
+  nextTurn: Turn | null,
+  transcriptTurns: Turn[],
+  promptLimit: number,
+): SummaryBatch[] {
+  const batches: SummaryBatch[] = [];
+  let start = 0;
+
+  while (start < turns.length) {
+    let end = start + 1;
+    while (end < turns.length) {
+      const candidateEnd = end + 1;
+      const candidatePrompt = buildBatchCompactionPrompt(
+        turns.slice(start, candidateEnd),
+        turns[candidateEnd] ?? nextTurn,
+        transcriptTurns.slice(start, candidateEnd),
+        [],
+      );
+      if (countTextTokens(candidatePrompt) > promptLimit) {
+        break;
+      }
+      end = candidateEnd;
+    }
+    batches.push({ start, end });
+    start = end;
+  }
+
+  return batches;
+}
+
+async function summarizeBatchRange(
+  v2: V2Client,
+  sourceSession: Session,
+  turns: Turn[],
+  nextTurn: Turn | null,
+  transcriptTurns: Turn[],
+  start: number,
+  end: number,
+  priorSummaries: string[],
+  budget: SummaryBudget,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string[]> {
+  const targetTurns = turns.slice(start, end);
+  const targetTranscript = transcriptTurns.slice(start, end);
+  const boundaryTurn = turns[end] ?? nextTurn;
+  const batchPrompt = buildBatchCompactionPrompt(
+    targetTurns,
+    boundaryTurn,
+    targetTranscript,
+    priorSummaries,
+  );
+
+  if (countTextTokens(batchPrompt) > budget.maxPromptTokens) {
+    return splitOrFailBatch(
+      "estimated batch input still exceeds the safe model budget",
+      v2,
+      sourceSession,
+      turns,
+      nextTurn,
+      transcriptTurns,
+      start,
+      end,
+      priorSummaries,
+      budget,
+      prompt,
+    );
+  }
+
+  let response: string;
   try {
-    return parseSummaries(firstResponse, turns.length);
+    response = await promptInFreshSession(
+      v2,
+      sourceSession,
+      `[TEMP SUMMARY BATCH ${start + 1}-${end}] ${sourceSession.title}`,
+      batchPrompt,
+      prompt,
+    );
+  } catch (error) {
+    if (isContextOverflow(error)) {
+      return splitOrFailBatch(
+        errorMessage(error),
+        v2,
+        sourceSession,
+        turns,
+        nextTurn,
+        transcriptTurns,
+        start,
+        end,
+        priorSummaries,
+        budget,
+        prompt,
+      );
+    }
+    throw error;
+  }
+
+  if (!response.trim()) {
+    return splitOrFailBatch(
+      "summary provider returned no text for the batch",
+      v2,
+      sourceSession,
+      turns,
+      nextTurn,
+      transcriptTurns,
+      start,
+      end,
+      priorSummaries,
+      budget,
+      prompt,
+    );
+  }
+
+  return parseOrRepairSummaries(
+    v2,
+    sourceSession,
+    targetTurns,
+    boundaryTurn,
+    response,
+    prompt,
+  );
+}
+
+async function splitOrFailBatch(
+  reason: string,
+  v2: V2Client,
+  sourceSession: Session,
+  turns: Turn[],
+  nextTurn: Turn | null,
+  transcriptTurns: Turn[],
+  start: number,
+  end: number,
+  priorSummaries: string[],
+  budget: SummaryBudget,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string[]> {
+  if (end - start <= 1) {
+    throw new SummaryContextBudgetError(
+      `Magic Compact cannot fit assistant turn ${start + 1} into an isolated summary batch: ${reason}. Run OpenCode /compact for this session.`,
+    );
+  }
+
+  const middle = start + Math.floor((end - start) / 2);
+  const first = await summarizeBatchRange(
+    v2,
+    sourceSession,
+    turns,
+    nextTurn,
+    transcriptTurns,
+    start,
+    middle,
+    priorSummaries,
+    budget,
+    prompt,
+  );
+  const second = await summarizeBatchRange(
+    v2,
+    sourceSession,
+    turns,
+    nextTurn,
+    transcriptTurns,
+    middle,
+    end,
+    tail([...priorSummaries, ...first], PRIOR_BATCH_SUMMARY_COUNT),
+    budget,
+    prompt,
+  );
+  return [...first, ...second];
+}
+
+async function parseOrRepairSummaries(
+  v2: V2Client,
+  sourceSession: Session,
+  turns: Turn[],
+  nextTurn: Turn | null,
+  response: string,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string[]> {
+  try {
+    return parseSummaries(response, turns.length);
   } catch (firstError) {
     const repairResponse = await repairSummaryInFreshSession(
       v2,
       sourceSession,
-      buildSummaryRepairPrompt(turns, nextTurn, firstResponse),
+      buildSummaryRepairPrompt(turns, nextTurn, response),
       prompt,
     );
     if (!repairResponse.trim()) {
@@ -168,15 +516,35 @@ async function generateSummaries(
   }
 }
 
+function tail<T>(values: T[], count: number): T[] {
+  return values.slice(Math.max(0, values.length - count));
+}
+
 async function repairSummaryInFreshSession(
   v2: V2Client,
   sourceSession: Session,
   repairPrompt: string,
   prompt: (sessionID: string, text: string) => Promise<string>,
 ): Promise<string> {
-  const repairSession = unwrap(
+  return promptInFreshSession(
+    v2,
+    sourceSession,
+    `[TEMP XML REPAIR] ${sourceSession.title}`,
+    repairPrompt,
+    prompt,
+  );
+}
+
+async function promptInFreshSession(
+  v2: V2Client,
+  sourceSession: Session,
+  title: string,
+  promptText: string,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string> {
+  const temporarySession = unwrap(
     await v2.session.create({
-      title: `[TEMP XML REPAIR] ${sourceSession.title}`,
+      title,
       ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
       ...(sourceSession.model
         ? {
@@ -196,20 +564,18 @@ async function repairSummaryInFreshSession(
   );
 
   try {
-    return await prompt(repairSession.id, repairPrompt);
+    return await prompt(temporarySession.id, promptText);
   } finally {
-    unwrap(await v2.session.delete({ sessionID: repairSession.id }));
+    unwrap(await v2.session.delete({ sessionID: temporarySession.id }));
   }
 }
 
-async function assertSummaryRequestFits(
+async function getSummaryBudget(
   v2: V2Client,
-  sessionID: string,
   sourceSession: Session,
-  prompt: string,
-): Promise<void> {
+): Promise<SummaryBudget | null> {
   if (!sourceSession.model) {
-    return;
+    return null;
   }
 
   try {
@@ -219,30 +585,72 @@ async function assertSummaryRequestFits(
     );
     const model = provider?.models[sourceSession.model.id];
     if (!model) {
-      return;
+      return null;
     }
 
-    const estimatedInput =
-      (await countSessionTokens(v2, sessionID)) + countTextTokens(prompt);
     const reservedOutput = Math.min(
       model.limit.output,
       SUMMARY_OUTPUT_RESERVE_CAP,
     );
-    if (estimatedInput + reservedOutput > model.limit.context) {
-      throw new SummaryContextBudgetError(
-        `Magic Compact still cannot fit the summary request after temporary tool-output pruning: estimated input ${estimatedInput} + reserved output ${reservedOutput} exceeds context ${model.limit.context}. Run OpenCode /compact now, or run /magic-trim and retry earlier in future sessions.`,
-      );
-    }
-  } catch (error) {
-    if (error instanceof SummaryContextBudgetError) {
-      throw error;
-    }
-    // Model metadata and local token estimation are advisory. The provider
-    // remains the final authority when either is unavailable.
+    const safetyMargin = Math.min(
+      8_192,
+      Math.max(1_024, Math.floor(model.limit.context * 0.05)),
+    );
+    const maxPromptTokens = Math.max(
+      1,
+      model.limit.context - reservedOutput - safetyMargin,
+    );
+    return {
+      context: model.limit.context,
+      reservedOutput,
+      maxPromptTokens,
+      batchPromptLimit: Math.min(
+        maxPromptTokens,
+        Math.floor(model.limit.context * BATCH_CONTEXT_FRACTION),
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function summaryRequestFits(
+  v2: V2Client,
+  sessionID: string,
+  prompt: string,
+  budget: SummaryBudget | null,
+): Promise<boolean | null> {
+  if (!budget) {
+    return null;
+  }
+  try {
+    const estimatedInput =
+      (await countSessionTokens(v2, sessionID)) + countTextTokens(prompt);
+    return estimatedInput + budget.reservedOutput <= budget.context;
+  } catch {
+    return null;
   }
 }
 
 class SummaryContextBudgetError extends Error {}
+
+class SummaryProviderError extends Error {
+  constructor(readonly providerError: NonNullable<AssistantMessage["error"]>) {
+    super(formatProviderError(providerError));
+  }
+}
+
+function isContextOverflow(error: unknown): boolean {
+  if (
+    error instanceof SummaryProviderError
+    && error.providerError.name === "ContextOverflowError"
+  ) {
+    return true;
+  }
+  return /context.{0,40}(overflow|exceed|length|limit)|maximum context/i.test(
+    errorMessage(error),
+  );
+}
 
 function formatProviderError(
   error: NonNullable<AssistantMessage["error"]>,
