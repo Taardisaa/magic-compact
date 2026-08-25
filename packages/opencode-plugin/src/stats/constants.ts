@@ -74,7 +74,9 @@ function moneySavedMessage(
   const dollarsPerMillion =
     modelID !== null ? getCachedReadPrice(modelID) : null;
   if (dollarsPerMillion === null) {
-    return `Cost savings unavailable: Model not supported: ${modelID}`;
+    return modelID === null
+      ? "Pricing unavailable: active model unknown"
+      : `Pricing unavailable for model: ${modelID}`;
   }
 
   return `Est. cost saved (${modelID}): $${((stats.cachedTokensSaved / 1_000_000) * dollarsPerMillion).toFixed(4)}`;

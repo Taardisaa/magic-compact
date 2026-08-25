@@ -115,7 +115,14 @@ export async function getProviderTokens(
     }
 
     const t = message.info.tokens;
-    return t.input + t.output + t.reasoning + t.cache.read + t.cache.write;
+    const total =
+      t.input + t.output + t.reasoning + t.cache.read + t.cache.write;
+
+    // Failed provider requests (notably context-overflow responses) can leave
+    // an assistant message whose usage object is present but entirely zeroed.
+    // Treat that as unavailable so callers use the local session estimate
+    // instead of reporting a nonsensical 0 -> N token compaction.
+    return total > 0 ? total : null;
   }
 
   return null;

@@ -54,4 +54,5 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 ### `test/` — Tests
 
 - `compact.test.ts` — Compaction prompt-setting and ephemeral-session tests
+- `stats.test.ts` — Provider-token fallback and stats notice tests
 - `trim.test.ts` — Trim planning and metadata idempotency tests

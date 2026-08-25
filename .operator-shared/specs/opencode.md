@@ -154,7 +154,7 @@ Known issues: We do not check for noops.
 
 - `countSessionTokens` counts persisted message part tokens locally plus estimated system prompt overhead.
 - The system prompt estimate uses the first assistant message with provider usage and the first user message text.
-- `getProviderTokens` reads provider-reported usage from the latest assistant message when available.
+- `getProviderTokens` reads positive provider-reported usage from the latest assistant message when available. Missing or zeroed usage, including failed context-overflow responses, falls back to local counting.
 
 ### Accounting
 
@@ -165,7 +165,7 @@ Known issues: We do not check for noops.
 ### Pricing
 
 - A static model-price mapping powers the money estimate.
-- If the active model has no price entry, the money estimate is omitted.
+- If the active model has no price entry, the money estimate is omitted and the notice says pricing is unavailable rather than implying that the model itself is unsupported.
 
 ### Notices
 
