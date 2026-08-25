@@ -48,6 +48,31 @@ export async function trimToolParts(
   return trimmed;
 }
 
+/**
+ * Shrink a disposable summarization fork before asking the model to compact it.
+ * The source session remains untouched, and no omission records are persisted
+ * because the fork is deleted as soon as summarization finishes.
+ */
+export async function trimToolPartsForSummary(
+  context: PruneContext,
+  turns: Turn[],
+): Promise<number> {
+  let trimmed = 0;
+  for (const turn of turns) {
+    for (const assistant of turn.assistants) {
+      for (const part of assistant.parts) {
+        if (
+          part.type === "tool"
+          && (await pruneToolPartForSummary(context, part))
+        ) {
+          trimmed += 1;
+        }
+      }
+    }
+  }
+  return trimmed;
+}
+
 async function pruneUserParts(
   context: PruneContext,
   message: MessageWithParts,
@@ -153,6 +178,79 @@ async function pruneToolPart(
     }),
   );
   return true;
+}
+
+async function pruneToolPartForSummary(
+  context: PruneContext,
+  part: ToolPart,
+): Promise<boolean> {
+  if (part.state.status !== "completed") {
+    return false;
+  }
+
+  const input = part.state.input;
+  if (part.tool === "write") {
+    omitTemporaryInput(input, "content", DEFAULT_LIMIT);
+  } else if (part.tool === "apply_patch") {
+    omitTemporaryInput(input, "patchText", DEFAULT_LIMIT);
+  } else if (part.tool === "bash") {
+    const command = unwrapString(input["command"]);
+    if (command && command.length > 1024) {
+      input["command"] =
+        `${command.slice(0, 512)}\n[REST OF COMMAND OMITTED FROM TEMPORARY SUMMARY CONTEXT]`;
+    }
+  } else if (part.tool === "edit") {
+    const oldString = unwrapString(input["oldString"]);
+    const newString = unwrapString(input["newString"]);
+    if (exceeds(`${oldString}\n${newString}`, DEFAULT_LIMIT)) {
+      input["oldString"] = "[Omitted from temporary summary context]";
+      input["newString"] = "[Omitted from temporary summary context]";
+    }
+  }
+
+  const output = part.state.output;
+  if (part.tool === "todowrite") {
+    part.state.output = "Successfully updated todos.";
+  } else if (part.tool === "skill") {
+    part.state.output =
+      "Skill contents omitted from temporary summary context.";
+  } else if (part.tool === "read") {
+    part.state.output = temporaryOutputNotice(output.length);
+  } else if (part.tool === "task") {
+    if (exceeds(output, TASK_OUTPUT_LIMIT)) {
+      part.state.output = temporaryOutputNotice(output.length);
+    }
+  } else if (part.tool !== "question" && exceeds(output, DEFAULT_LIMIT)) {
+    part.state.output = temporaryOutputNotice(output.length);
+  }
+
+  unwrap(
+    await context.v2.part.update({
+      sessionID: context.sessionID,
+      messageID: part.messageID,
+      partID: part.id,
+      part: {
+        ...part,
+        sessionID: context.sessionID,
+      },
+    }),
+  );
+  return true;
+}
+
+function omitTemporaryInput(
+  input: Record<string, unknown>,
+  key: string,
+  limit: { words: number; chars: number },
+): void {
+  const content = unwrapString(input[key]);
+  if (content && exceeds(content, limit)) {
+    input[key] = "[Omitted from temporary summary context]";
+  }
+}
+
+function temporaryOutputNotice(length: number): string {
+  return `[${length} characters omitted from temporary summary context. The original tool call remains in the source session.]`;
 }
 
 async function applyInputOmissions(

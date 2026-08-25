@@ -51,17 +51,22 @@ ${buildXmlTemplate(turns, nextTurn)}
 export function buildSummaryRepairPrompt(
   turns: Turn[],
   nextTurn: Turn | null,
+  malformedResponse: string,
 ): string {
   return `<system>
 # Attention: Repair the Previous Summary Response
 
-Your previous response could not be parsed because it did not match the required XML structure. Correct it now.
+The summary response below could not be parsed because it did not match the required XML structure. Correct it now.
 
 Return exactly the XML template below with every assistant placeholder replaced by a faithful summary. Preserve each truncated user anchor exactly as shown. Do not add markdown fences, analysis, explanations, tool calls, or text outside the XML block.
 
 Your response must start with <summary> and end with </summary>.
 
 ${buildXmlTemplate(turns, nextTurn)}
+
+<malformed-summary-response>
+${malformedResponse}
+</malformed-summary-response>
 </system>`;
 }
 

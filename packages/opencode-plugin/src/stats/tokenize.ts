@@ -3,7 +3,7 @@ import { encode } from "gpt-tokenizer";
 import { unwrap, type V2Client } from "../api";
 import type { MessageWithParts } from "../compact/plan";
 
-function countGptTokens(text: string): number {
+export function countTextTokens(text: string): number {
   return encode(text).length;
 }
 
@@ -90,7 +90,7 @@ function estimateSystemPromptTokens(messages: MessageWithParts[]): number {
 
 function countMessageGptTokens(message: MessageWithParts): number {
   const count = message.parts.map(part =>
-    countGptTokens(extractPartTexts(part).join("\n\n")),
+    countTextTokens(extractPartTexts(part).join("\n\n")),
   );
   return count.reduce((sum, count) => sum + count, 0);
 }

@@ -1,8 +1,12 @@
-import type { Session, TextPart } from "@opencode-ai/sdk/v2";
+import type { AssistantMessage, Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
 import { summaryMetadata, summaryPartID } from "./constants";
-import { createCompactionPlan, type Turn } from "./plan";
+import { createCompactionPlan, createTrimPlan, type Turn } from "./plan";
+import { trimToolPartsForSummary } from "./prune";
 import { buildCompactionPrompt, buildSummaryRepairPrompt } from "./template";
+import { countSessionTokens, countTextTokens } from "../stats/tokenize";
+
+const SUMMARY_OUTPUT_RESERVE_CAP = 32_768;
 
 export type CompactSessionResult = {
   summarizedTurns: Turn[];
@@ -54,6 +58,15 @@ async function generateSummariesInEphemeralSession(
       }),
     );
 
+    // Claude Code clears stale tool output before its one-shot summary call.
+    // Do the same only inside this disposable fork so a nearly-full source
+    // session still has enough room to generate its summary.
+    const temporaryTrimPlan = await createTrimPlan(v2, compactionSession.id, 0);
+    await trimToolPartsForSummary(
+      { v2, sessionID: compactionSession.id },
+      temporaryTrimPlan.trimmedTurns,
+    );
+
     return await generateSummaries(
       v2,
       compactionSession.id,
@@ -78,10 +91,13 @@ async function generateSummaries(
   nextTurn: Turn | null,
 ): Promise<string[]> {
   const variant = sourceSession.model?.variant;
-  const prompt = async (text: string): Promise<string> => {
+  const prompt = async (
+    targetSessionID: string,
+    text: string,
+  ): Promise<string> => {
     const response = unwrap(
       await v2.session.prompt({
-        sessionID,
+        sessionID: targetSessionID,
         ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
         ...(sourceSession.model
           ? {
@@ -101,19 +117,46 @@ async function generateSummaries(
       }),
     );
 
+    if (response.info.error) {
+      throw new Error(formatProviderError(response.info.error));
+    }
+
     return response.parts
       .filter((part): part is TextPart => part.type === "text")
       .map(part => part.text)
       .join("\n");
   };
 
-  const firstResponse = await prompt(buildCompactionPrompt(turns, nextTurn));
+  const compactionPrompt = buildCompactionPrompt(turns, nextTurn);
+  await assertSummaryRequestFits(
+    v2,
+    sessionID,
+    sourceSession,
+    compactionPrompt,
+  );
+
+  const firstResponse = await prompt(sessionID, compactionPrompt);
+  if (!firstResponse.trim()) {
+    throw new Error(
+      "Summary model returned no text. The provider likely rejected or aborted the request before XML generation.",
+    );
+  }
+
   try {
     return parseSummaries(firstResponse, turns.length);
   } catch (firstError) {
-    const repairResponse = await prompt(
-      buildSummaryRepairPrompt(turns, nextTurn),
+    const repairResponse = await repairSummaryInFreshSession(
+      v2,
+      sourceSession,
+      buildSummaryRepairPrompt(turns, nextTurn, firstResponse),
+      prompt,
     );
+    if (!repairResponse.trim()) {
+      throw new Error(
+        `Summary XML repair returned no text. Initial failure: ${errorMessage(firstError)}`,
+        { cause: firstError },
+      );
+    }
     try {
       return parseSummaries(repairResponse, turns.length);
     } catch (repairError) {
@@ -123,6 +166,92 @@ async function generateSummaries(
       );
     }
   }
+}
+
+async function repairSummaryInFreshSession(
+  v2: V2Client,
+  sourceSession: Session,
+  repairPrompt: string,
+  prompt: (sessionID: string, text: string) => Promise<string>,
+): Promise<string> {
+  const repairSession = unwrap(
+    await v2.session.create({
+      title: `[TEMP XML REPAIR] ${sourceSession.title}`,
+      ...(sourceSession.agent ? { agent: sourceSession.agent } : {}),
+      ...(sourceSession.model
+        ? {
+            model: {
+              providerID: sourceSession.model.providerID,
+              id: sourceSession.model.id,
+              ...(sourceSession.model.variant
+                ? { variant: sourceSession.model.variant }
+                : {}),
+            },
+          }
+        : {}),
+      ...(sourceSession.permission
+        ? { permission: sourceSession.permission }
+        : {}),
+    }),
+  );
+
+  try {
+    return await prompt(repairSession.id, repairPrompt);
+  } finally {
+    unwrap(await v2.session.delete({ sessionID: repairSession.id }));
+  }
+}
+
+async function assertSummaryRequestFits(
+  v2: V2Client,
+  sessionID: string,
+  sourceSession: Session,
+  prompt: string,
+): Promise<void> {
+  if (!sourceSession.model) {
+    return;
+  }
+
+  try {
+    const providers = unwrap(await v2.provider.list());
+    const provider = providers.all.find(
+      candidate => candidate.id === sourceSession.model?.providerID,
+    );
+    const model = provider?.models[sourceSession.model.id];
+    if (!model) {
+      return;
+    }
+
+    const estimatedInput =
+      (await countSessionTokens(v2, sessionID)) + countTextTokens(prompt);
+    const reservedOutput = Math.min(
+      model.limit.output,
+      SUMMARY_OUTPUT_RESERVE_CAP,
+    );
+    if (estimatedInput + reservedOutput > model.limit.context) {
+      throw new SummaryContextBudgetError(
+        `Magic Compact still cannot fit the summary request after temporary tool-output pruning: estimated input ${estimatedInput} + reserved output ${reservedOutput} exceeds context ${model.limit.context}. Run OpenCode /compact now, or run /magic-trim and retry earlier in future sessions.`,
+      );
+    }
+  } catch (error) {
+    if (error instanceof SummaryContextBudgetError) {
+      throw error;
+    }
+    // Model metadata and local token estimation are advisory. The provider
+    // remains the final authority when either is unavailable.
+  }
+}
+
+class SummaryContextBudgetError extends Error {}
+
+function formatProviderError(
+  error: NonNullable<AssistantMessage["error"]>,
+): string {
+  const message =
+    "message" in error.data && typeof error.data.message === "string"
+      ? `: ${error.data.message}`
+      : "";
+  return `Summary provider failed with ${error.name}${message}`;
 }
 
 function errorMessage(error: unknown): string {

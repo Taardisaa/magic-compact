@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import type { Message, Part, Session, TextPart } from "@opencode-ai/sdk/v2";
+import type {
+  Message,
+  Part,
+  Session,
+  TextPart,
+  ToolPart,
+} from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import { compactSession } from "../src/compact/compact";
 import type { MessageWithParts } from "../src/compact/plan";
@@ -61,7 +67,7 @@ describe("magic compact", () => {
     expect(requests.prompts[0]).not.toHaveProperty("variant");
   });
 
-  test("repairs one malformed summary response in the ephemeral session", async () => {
+  test("repairs one malformed summary response in a fresh minimal session", async () => {
     const requests = await runCompaction(
       {
         ...session("source"),
@@ -80,7 +86,7 @@ describe("magic compact", () => {
 
     expect(requests.prompts).toHaveLength(2);
     expect(requests.prompts[1]).toMatchObject({
-      sessionID: "ephemeral",
+      sessionID: "repair",
       agent: "plan",
       model: {
         providerID: "qwen",
@@ -91,10 +97,13 @@ describe("magic compact", () => {
     expect(promptText(requests.prompts[1]!)).toContain(
       "Repair the Previous Summary Response",
     );
-    expect(requests.deletes).toEqual(["ephemeral"]);
+    expect(promptText(requests.prompts[1]!)).toContain(
+      "I summarized the request but forgot the XML wrapper.",
+    );
+    expect(requests.deletes).toEqual(["repair", "ephemeral"]);
   });
 
-  test("stops after one unsuccessful repair and deletes the ephemeral session", async () => {
+  test("stops after one unsuccessful repair and deletes both temporary sessions", async () => {
     const requests = requestLog();
 
     await expect(
@@ -102,6 +111,72 @@ describe("magic compact", () => {
     ).rejects.toThrow("Summary XML parsing failed after one repair attempt.");
 
     expect(requests.prompts).toHaveLength(2);
+    expect(requests.deletes).toEqual(["repair", "ephemeral"]);
+  });
+
+  test("does not misclassify an empty provider response as malformed XML", async () => {
+    const requests = requestLog();
+
+    await expect(
+      runCompaction(session("source"), [""], requests),
+    ).rejects.toThrow("Summary model returned no text");
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(0);
+    expect(requests.deletes).toEqual(["ephemeral"]);
+  });
+
+  test("surfaces a provider context error without attempting XML repair", async () => {
+    const requests = requestLog();
+    requests.providerError = {
+      name: "ContextOverflowError",
+      data: { message: "prompt plus output exceeds the context window" },
+    };
+
+    await expect(
+      runCompaction(session("source"), undefined, requests),
+    ).rejects.toThrow(
+      "Summary provider failed with ContextOverflowError: prompt plus output exceeds the context window",
+    );
+
+    expect(requests.prompts).toHaveLength(1);
+    expect(requests.creates).toHaveLength(0);
+    expect(requests.deletes).toEqual(["ephemeral"]);
+  });
+
+  test("trims large tool output only in the temporary summary fork", async () => {
+    const requests = requestLog();
+    const messages = compactableMessages([
+      toolPart("tool", "read", "x".repeat(2_000)),
+    ]);
+
+    await runCompaction(session("source"), undefined, requests, messages);
+
+    const temporaryUpdate = requests.partUpdates.find(
+      request => request["sessionID"] === "ephemeral",
+    );
+    const part = temporaryUpdate?.["part"] as ToolPart | undefined;
+    expect(part?.state.status).toBe("completed");
+    if (part?.state.status === "completed") {
+      expect(part.state.output).toContain(
+        "omitted from temporary summary context",
+      );
+    }
+  });
+
+  test("fails early with an actionable error when the pruned request still cannot fit", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 100, output: 50 };
+    const source = {
+      ...session("source"),
+      model: { providerID: "provider", id: "model" },
+    };
+
+    await expect(runCompaction(source, undefined, requests)).rejects.toThrow(
+      "still cannot fit the summary request",
+    );
+
+    expect(requests.prompts).toHaveLength(0);
     expect(requests.deletes).toEqual(["ephemeral"]);
   });
 });
@@ -109,21 +184,33 @@ describe("magic compact", () => {
 type RequestLog = {
   prompts: Record<string, unknown>[];
   updates: Record<string, unknown>[];
+  creates: Record<string, unknown>[];
   deletes: string[];
+  partUpdates: Record<string, unknown>[];
+  modelLimit?: { context: number; output: number };
+  providerError?: {
+    name: "ContextOverflowError";
+    data: { message: string };
+  };
 };
 
 async function runCompaction(
   sourceSession: Session,
-  responses = [
+  responses: string[] = [
     "<summary><user>Request</user><assistant>Completed the request.</assistant></summary>",
   ],
   requests = requestLog(),
+  messages = compactableMessages(),
 ): Promise<RequestLog> {
   let responseIndex = 0;
   const v2 = {
     session: {
-      messages: async () => ({ data: compactableMessages() }),
+      messages: async () => ({ data: messages }),
       fork: async () => ({ data: session("ephemeral") }),
+      create: async (request: Record<string, unknown>) => {
+        requests.creates.push(request);
+        return { data: session("repair") };
+      },
       update: async (request: Record<string, unknown>) => {
         requests.updates.push(request);
         return { data: session("ephemeral") };
@@ -133,6 +220,7 @@ async function runCompaction(
         const text = responses[responseIndex++] ?? responses.at(-1) ?? "";
         return {
           data: {
+            info: { error: requests.providerError },
             parts: [textPart("response", "ephemeral", "response", text)],
           },
         };
@@ -143,7 +231,28 @@ async function runCompaction(
       },
     },
     part: {
-      update: async ({ part }: { part: TextPart }) => ({ data: part }),
+      update: async (request: Record<string, unknown>) => {
+        requests.partUpdates.push(request);
+        return { data: request["part"] };
+      },
+    },
+    provider: {
+      list: async () => ({
+        data: {
+          all: requests.modelLimit
+            ? [
+                {
+                  id: "provider",
+                  models: {
+                    model: { limit: requests.modelLimit },
+                  },
+                },
+              ]
+            : [],
+          connected: [],
+          default: {},
+        },
+      }),
     },
   } as unknown as V2Client;
 
@@ -152,7 +261,13 @@ async function runCompaction(
 }
 
 function requestLog(): RequestLog {
-  return { prompts: [], updates: [], deletes: [] };
+  return {
+    prompts: [],
+    updates: [],
+    creates: [],
+    deletes: [],
+    partUpdates: [],
+  };
 }
 
 function promptText(request: Record<string, unknown>): string {
@@ -160,12 +275,12 @@ function promptText(request: Record<string, unknown>): string {
   return parts[0]?.text ?? "";
 }
 
-function compactableMessages(): MessageWithParts[] {
+function compactableMessages(assistantParts: Part[] = []): MessageWithParts[] {
   return [
     message("user", "user", [
       textPart("user-text", "source", "user", "Request"),
     ]),
-    message("assistant", "assistant", []),
+    message("assistant", "assistant", assistantParts),
   ];
 }
 
@@ -175,8 +290,40 @@ function message(
   parts: Part[],
 ): MessageWithParts {
   return {
-    info: { id, role } as Message,
+    info: {
+      id,
+      role,
+      ...(role === "assistant"
+        ? {
+            tokens: {
+              input: 0,
+              output: 0,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+          }
+        : {}),
+    } as Message,
     parts,
+  };
+}
+
+function toolPart(id: string, tool: string, output: string): ToolPart {
+  return {
+    id,
+    sessionID: "source",
+    messageID: "assistant",
+    type: "tool",
+    callID: "call",
+    tool,
+    state: {
+      status: "completed",
+      input: {},
+      output,
+      title: tool,
+      metadata: {},
+      time: { start: 0, end: 1 },
+    },
   };
 }
 

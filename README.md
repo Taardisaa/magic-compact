@@ -76,6 +76,8 @@ To compact, run `/magic-compact [N]` with an optional argument indicating how ma
 
 - `N` is the number of recent assistant turns to preserve as-is. Default: `0` (summarize everything).
 - A backup session is created before the current conversation is compacted. If compaction fails, you will return to the backup.
+- On OpenCode, a disposable fork trims bulky tool I/O before the summary request. If the pruned request still cannot fit the model context, Magic Compact stops with an actionable error instead of reporting a misleading XML failure.
+- Malformed non-empty XML is repaired once in a fresh minimal session; provider errors and empty responses are not retried as formatting problems.
 
 Examples:
 
