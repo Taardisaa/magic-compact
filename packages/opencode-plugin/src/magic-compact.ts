@@ -12,7 +12,9 @@ import {
   recordPruningStats,
   reloadTurns,
   updateCompactionMetadata,
+  updateProgressNotice,
 } from "./compact/session";
+import type { CompactProgressReporter } from "./compact/progress";
 import { createCompactionPlan } from "./compact/plan";
 import { pruneSummarizedTurns } from "./compact/prune";
 import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
@@ -58,13 +60,31 @@ export async function executeMagicCompact(
       (await getProviderTokens(v2, sessionID))
       ?? (await countSessionTokens(v2, sessionID));
 
-    const progressMessageID = await injectProgressNotice(v2, sessionID);
+    const progressNotice = await injectProgressNotice(
+      v2,
+      sessionID,
+      sourcePlan.summarizedTurns.length,
+    );
+    const reportProgress: CompactProgressReporter = async update => {
+      try {
+        await updateProgressNotice(v2, sessionID, progressNotice, update);
+      } catch {
+        // Progress is best-effort UI state. A stale or unsupported part update
+        // must never roll back an otherwise valid compaction.
+      }
+    };
     let compacted;
     try {
       // Compact current session
-      compacted = await compactSession(v2, sourceSession, sessionID, keepTurns);
+      compacted = await compactSession(
+        v2,
+        sourceSession,
+        sessionID,
+        keepTurns,
+        reportProgress,
+      );
     } finally {
-      await deleteProgressNotice(v2, sessionID, progressMessageID);
+      await deleteProgressNotice(v2, sessionID, progressNotice);
     }
 
     // Mark the new compaction boundary for future recompactions

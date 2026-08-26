@@ -33,8 +33,9 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 
 - `plan.ts` — Turn model and `CompactionPlan` / `TrimPlan` planning
 - `compact.ts` — `compactSession` driver, temporary-fork budget guard, dynamic turn batching, recursive overflow splitting, isolated XML repair, and `CompactSessionResult`
+- `progress.ts` — Typed compaction progress phases, reporter contract, and in-place notice text formatting
 - `prune.ts` — `pruneSummarizedTurns`, persistent `trimToolParts`, and non-persistent temporary-fork trimming
-- `session.ts` — Backup create/apply, metadata, progress-notice injection
+- `session.ts` — Backup create/apply, metadata, and progress-notice injection/update/deletion
 - `template.ts` — Compaction prompt builder (`buildCompactionPrompt`)
 - `constants.ts` — Post-compaction notice, boundary metadata, part-ID helpers
 
@@ -54,5 +55,6 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 ### `test/` — Tests
 
 - `compact.test.ts` — Compaction prompt-setting and ephemeral-session tests
+- `progress.test.ts` — Dynamic progress formatting and text-part lifecycle tests
 - `stats.test.ts` — Provider-token fallback and stats notice tests
 - `trim.test.ts` — Trim planning and metadata idempotency tests

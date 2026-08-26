@@ -14,11 +14,17 @@ import {
   statsMessage,
   trimStatsMessage,
 } from "../stats/constants";
+import { formatCompactProgress, type CompactProgressUpdate } from "./progress";
 
 export type MagicCompactMetadata = {
   sourceSessionId: string;
   compactedAt: number;
   compactionCount: number;
+};
+
+export type ProgressNotice = {
+  messageID: string;
+  part: TextPart;
 };
 
 export async function createBackup(
@@ -67,7 +73,8 @@ export async function applyBackup(
 export async function injectProgressNotice(
   v2: V2Client,
   sessionID: string,
-): Promise<string> {
+  totalTurns: number,
+): Promise<ProgressNotice> {
   const message = unwrap(
     await v2.session.prompt({
       sessionID,
@@ -75,7 +82,11 @@ export async function injectProgressNotice(
       parts: [
         {
           type: "text",
-          text: "Magic Compact: Compaction in progress...",
+          text: formatCompactProgress({
+            phase: "preparing",
+            completedTurns: 0,
+            totalTurns,
+          }),
           ignored: true,
           metadata: {
             magicCompact: {
@@ -87,18 +98,48 @@ export async function injectProgressNotice(
     }),
   );
 
-  return message.info.id;
+  const part = message.parts.find(
+    (candidate): candidate is TextPart => candidate.type === "text",
+  );
+  if (!part) {
+    throw new Error("Magic Compact progress notice has no text part.");
+  }
+
+  return { messageID: message.info.id, part };
+}
+
+export async function updateProgressNotice(
+  v2: V2Client,
+  sessionID: string,
+  notice: ProgressNotice,
+  update: CompactProgressUpdate,
+): Promise<void> {
+  const part: TextPart = {
+    ...notice.part,
+    sessionID,
+    messageID: notice.messageID,
+    text: formatCompactProgress(update),
+  };
+
+  notice.part = unwrap(
+    await v2.part.update({
+      sessionID,
+      messageID: notice.messageID,
+      partID: part.id,
+      part,
+    }),
+  ) as TextPart;
 }
 
 export async function deleteProgressNotice(
   v2: V2Client,
   sessionID: string,
-  messageID: string,
+  notice: ProgressNotice,
 ): Promise<void> {
   unwrap(
     await v2.session.deleteMessage({
       sessionID,
-      messageID,
+      messageID: notice.messageID,
     }),
   );
 }

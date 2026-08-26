@@ -9,6 +9,10 @@ import type {
 import type { V2Client } from "../src/api";
 import { compactSession } from "../src/compact/compact";
 import type { MessageWithParts } from "../src/compact/plan";
+import type {
+  CompactProgressReporter,
+  CompactProgressUpdate,
+} from "../src/compact/progress";
 
 describe("magic compact", () => {
   test("preserves the active prompt prefix and model", async () => {
@@ -217,6 +221,81 @@ describe("magic compact", () => {
     ]);
   });
 
+  test("reports completed turns as summary batches finish", async () => {
+    const requests = requestLog();
+    requests.modelLimit = { context: 4_000, output: 500 };
+    const source = {
+      ...session("source"),
+      model: { providerID: "provider", id: "model" },
+    };
+    const messages = compactableTurnMessages(2, "word ".repeat(1_800));
+    const progress: CompactProgressUpdate[] = [];
+
+    await runCompaction(
+      source,
+      [
+        "<summary><user>Request 1</user><assistant>Summary one.</assistant></summary>",
+        "<summary><user>Request 2</user><assistant>Summary two.</assistant></summary>",
+      ],
+      requests,
+      messages,
+      update => {
+        progress.push(update);
+      },
+    );
+
+    expect(progress).toEqual([
+      {
+        phase: "preparing",
+        completedTurns: 0,
+        totalTurns: 2,
+      },
+      {
+        phase: "summarizing",
+        completedTurns: 0,
+        totalTurns: 2,
+        detail: "processing turns 1-1",
+      },
+      {
+        phase: "summarizing",
+        completedTurns: 1,
+        totalTurns: 2,
+      },
+      {
+        phase: "summarizing",
+        completedTurns: 1,
+        totalTurns: 2,
+        detail: "processing turns 2-2",
+      },
+      {
+        phase: "summarizing",
+        completedTurns: 2,
+        totalTurns: 2,
+      },
+      {
+        phase: "applying",
+        completedTurns: 2,
+        totalTurns: 2,
+      },
+    ]);
+  });
+
+  test("does not fail compaction when progress reporting fails", async () => {
+    const reporter: CompactProgressReporter = () => {
+      throw new Error("TUI update unavailable");
+    };
+
+    await expect(
+      runCompaction(
+        session("source"),
+        undefined,
+        requestLog(),
+        compactableMessages(),
+        reporter,
+      ),
+    ).resolves.toBeDefined();
+  });
+
   test("recursively splits a batch when the provider reports context overflow", async () => {
     const requests = requestLog();
     requests.modelLimit = { context: 4_000, output: 500 };
@@ -334,6 +413,7 @@ async function runCompaction(
   ],
   requests = requestLog(),
   messages = compactableMessages(),
+  reportProgress?: CompactProgressReporter,
 ): Promise<RequestLog> {
   let responseIndex = 0;
   let batchIndex = 0;
@@ -400,7 +480,7 @@ async function runCompaction(
     },
   } as unknown as V2Client;
 
-  await compactSession(v2, sourceSession, "source", 0);
+  await compactSession(v2, sourceSession, "source", 0, reportProgress);
   return requests;
 }
 

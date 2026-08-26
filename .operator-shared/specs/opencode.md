@@ -21,7 +21,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 6. Copy omission and stats caches to the backup.
 7. Rename the backup to `[Backup] ${title} ${timestamp}` and write backup metadata.
 8. Measure pre-compaction tokens using provider tokens when available, otherwise local counting.
-9. Insert an ignored no-reply progress message.
+9. Insert an ignored no-reply progress message and retain its text-part handle for in-place updates.
 10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
 11. In the ephemeral fork only, trim large completed tool inputs and outputs without writing omission-cache records.
 12. When model limits are available, estimate the pruned request size.
@@ -31,7 +31,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 16. If a batch receives a provider context-overflow error, recursively split it at a turn boundary and retry each half.
 17. Abort with an actionable error if one isolated turn still cannot fit.
 18. Abort immediately on other provider errors; do not misclassify them as malformed XML.
-19. Parse and accumulate per-turn summaries without mutating the source session.
+19. Parse and accumulate per-turn summaries without mutating the source session. Update the same progress part after each validated batch or recursively split range, reporting completed assistant turns out of the total.
 20. If a non-empty response has malformed XML, create a fresh, non-forked repair session containing only the malformed response and strict XML template.
 21. Send at most one repair request, parse it, and delete the repair session in cleanup.
 22. Abort if the single repair attempt also fails.
@@ -109,6 +109,7 @@ Known issues: We do not check for noops.
 - Batches preserve complete turn boundaries, run sequentially, and carry at most the two most recent summaries forward as context.
 - Batch results are accumulated in memory and injected into the source only after every batch has produced the expected number of summaries.
 - Context-overflow failures recursively bisect multi-turn batches. A single oversized turn aborts safely and recommends OpenCode's native `/compact`.
+- The ignored progress notice moves through preparing, summarizing, XML repair, and applying phases. Batch progress advances only after XML for a complete turn range validates; active ranges reflect recursive splits. Progress-part update failures are non-fatal.
 - A malformed repair response aborts compaction and follows normal recovery behavior.
 - Each summary is written as a text part on the first assistant message in the summarized turn.
 - Summary parts use deterministic IDs: `prt_-magic_summary_${messageID}`.

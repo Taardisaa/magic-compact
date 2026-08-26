@@ -9,6 +9,10 @@ import {
   buildSummaryRepairPrompt,
 } from "./template";
 import { countSessionTokens, countTextTokens } from "../stats/tokenize";
+import type {
+  CompactProgressReporter,
+  CompactProgressUpdate,
+} from "./progress";
 
 const SUMMARY_OUTPUT_RESERVE_CAP = 32_768;
 const BATCH_CONTEXT_FRACTION = 0.7;
@@ -36,16 +40,28 @@ export async function compactSession(
   session: Session,
   sessionID: string,
   keepTurns: number,
+  reportProgress?: CompactProgressReporter,
 ): Promise<CompactSessionResult> {
   const plan = await createCompactionPlan(v2, sessionID, keepTurns);
+  await reportCompactProgress(reportProgress, {
+    phase: "preparing",
+    completedTurns: 0,
+    totalTurns: plan.summarizedTurns.length,
+  });
   const summaries = await generateSummariesInEphemeralSession(
     v2,
     session,
     plan.summarizedTurns,
     plan.nextTurn,
     keepTurns,
+    reportProgress,
   );
 
+  await reportCompactProgress(reportProgress, {
+    phase: "applying",
+    completedTurns: plan.summarizedTurns.length,
+    totalTurns: plan.summarizedTurns.length,
+  });
   await injectSummaries(v2, sessionID, plan.summarizedTurns, summaries);
 
   return {
@@ -60,6 +76,7 @@ async function generateSummariesInEphemeralSession(
   turns: Turn[],
   nextTurn: Turn | null,
   keepTurns: number,
+  reportProgress?: CompactProgressReporter,
 ): Promise<string[]> {
   // Fork the source session so the summarizer sees the full conversation it
   // is asked to summarize. A freshly created session has no history: the
@@ -110,6 +127,7 @@ async function generateSummariesInEphemeralSession(
       turns,
       nextTurn,
       temporarySummaryPlan.summarizedTurns,
+      reportProgress,
     );
   } finally {
     unwrap(
@@ -168,6 +186,7 @@ async function generateSummaries(
   turns: Turn[],
   nextTurn: Turn | null,
   transcriptTurns: Turn[],
+  reportProgress?: CompactProgressReporter,
 ): Promise<string[]> {
   const variant = sourceSession.model?.variant;
   const prompt = async (
@@ -224,9 +243,16 @@ async function generateSummaries(
       transcriptTurns,
       budget,
       prompt,
+      reportProgress,
     );
   }
 
+  await reportCompactProgress(reportProgress, {
+    phase: "summarizing",
+    completedTurns: 0,
+    totalTurns: turns.length,
+    detail: `processing turns 1-${turns.length}`,
+  });
   let firstResponse: string;
   try {
     firstResponse = await prompt(sessionID, compactionPrompt);
@@ -240,6 +266,7 @@ async function generateSummaries(
         transcriptTurns,
         budget,
         prompt,
+        reportProgress,
       );
     }
     throw error;
@@ -254,6 +281,7 @@ async function generateSummaries(
         transcriptTurns,
         budget,
         prompt,
+        reportProgress,
       );
     }
     throw new Error(
@@ -261,14 +289,27 @@ async function generateSummaries(
     );
   }
 
-  return parseOrRepairSummaries(
+  const summaries = await parseOrRepairSummaries(
     v2,
     sourceSession,
     turns,
     nextTurn,
     firstResponse,
     prompt,
+    async () =>
+      reportCompactProgress(reportProgress, {
+        phase: "repairing",
+        completedTurns: 0,
+        totalTurns: turns.length,
+        detail: `turns 1-${turns.length}`,
+      }),
   );
+  await reportCompactProgress(reportProgress, {
+    phase: "summarizing",
+    completedTurns: turns.length,
+    totalTurns: turns.length,
+  });
+  return summaries;
 }
 
 async function generateSummariesInBatches(
@@ -279,6 +320,7 @@ async function generateSummariesInBatches(
   transcriptTurns: Turn[],
   budget: SummaryBudget,
   prompt: (sessionID: string, text: string) => Promise<string>,
+  reportProgress?: CompactProgressReporter,
 ): Promise<string[]> {
   const batches = planSummaryBatches(
     turns,
@@ -300,6 +342,7 @@ async function generateSummariesInBatches(
       tail(summaries, PRIOR_BATCH_SUMMARY_COUNT),
       budget,
       prompt,
+      reportProgress,
     );
     summaries.push(...batchSummaries);
   }
@@ -354,6 +397,7 @@ async function summarizeBatchRange(
   priorSummaries: string[],
   budget: SummaryBudget,
   prompt: (sessionID: string, text: string) => Promise<string>,
+  reportProgress?: CompactProgressReporter,
 ): Promise<string[]> {
   const targetTurns = turns.slice(start, end);
   const targetTranscript = transcriptTurns.slice(start, end);
@@ -378,9 +422,16 @@ async function summarizeBatchRange(
       priorSummaries,
       budget,
       prompt,
+      reportProgress,
     );
   }
 
+  await reportCompactProgress(reportProgress, {
+    phase: "summarizing",
+    completedTurns: start,
+    totalTurns: turns.length,
+    detail: `processing turns ${start + 1}-${end}`,
+  });
   let response: string;
   try {
     response = await promptInFreshSession(
@@ -404,6 +455,7 @@ async function summarizeBatchRange(
         priorSummaries,
         budget,
         prompt,
+        reportProgress,
       );
     }
     throw error;
@@ -422,17 +474,31 @@ async function summarizeBatchRange(
       priorSummaries,
       budget,
       prompt,
+      reportProgress,
     );
   }
 
-  return parseOrRepairSummaries(
+  const summaries = await parseOrRepairSummaries(
     v2,
     sourceSession,
     targetTurns,
     boundaryTurn,
     response,
     prompt,
+    async () =>
+      reportCompactProgress(reportProgress, {
+        phase: "repairing",
+        completedTurns: start,
+        totalTurns: turns.length,
+        detail: `turns ${start + 1}-${end}`,
+      }),
   );
+  await reportCompactProgress(reportProgress, {
+    phase: "summarizing",
+    completedTurns: end,
+    totalTurns: turns.length,
+  });
+  return summaries;
 }
 
 async function splitOrFailBatch(
@@ -447,6 +513,7 @@ async function splitOrFailBatch(
   priorSummaries: string[],
   budget: SummaryBudget,
   prompt: (sessionID: string, text: string) => Promise<string>,
+  reportProgress?: CompactProgressReporter,
 ): Promise<string[]> {
   if (end - start <= 1) {
     throw new SummaryContextBudgetError(
@@ -466,6 +533,7 @@ async function splitOrFailBatch(
     priorSummaries,
     budget,
     prompt,
+    reportProgress,
   );
   const second = await summarizeBatchRange(
     v2,
@@ -478,6 +546,7 @@ async function splitOrFailBatch(
     tail([...priorSummaries, ...first], PRIOR_BATCH_SUMMARY_COUNT),
     budget,
     prompt,
+    reportProgress,
   );
   return [...first, ...second];
 }
@@ -489,10 +558,12 @@ async function parseOrRepairSummaries(
   nextTurn: Turn | null,
   response: string,
   prompt: (sessionID: string, text: string) => Promise<string>,
+  reportRepair?: () => Promise<void>,
 ): Promise<string[]> {
   try {
     return parseSummaries(response, turns.length);
   } catch (firstError) {
+    await reportRepair?.();
     const repairResponse = await repairSummaryInFreshSession(
       v2,
       sourceSession,
@@ -513,6 +584,20 @@ async function parseOrRepairSummaries(
         { cause: repairError },
       );
     }
+  }
+}
+
+async function reportCompactProgress(
+  reporter: CompactProgressReporter | undefined,
+  update: CompactProgressUpdate,
+): Promise<void> {
+  if (!reporter) {
+    return;
+  }
+  try {
+    await reporter(update);
+  } catch {
+    // Progress reporting is deliberately non-fatal.
   }
 }
 
