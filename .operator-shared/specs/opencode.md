@@ -52,15 +52,15 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 22. Abort if the single repair attempt also fails.
 23. Delete every batch, repair, and ephemeral session in cleanup.
 24. Delete the progress message in cleanup.
-25. Only after every summary succeeds, upsert deterministic summary text parts onto the first assistant message in each summarized turn.
-26. Inject the post-compaction boundary notice.
-27. Reload the full session and sweep every already-summarized turn, including history before the latest boundary.
-28. Serialize each swept turn's complete tool parts into the local omission cache, replace them with one retrievable archive notice, and remove the active tool parts.
-29. If detailed summaries exceed 24, generate one bounded historical rollup for the oldest range while preserving the newest 16 detailed summaries. Archive the exact replaced summaries and their archive pointers locally.
-30. Update current session metadata with `compactionCount`.
-31. Measure post-compaction tokens.
-32. Update stats and inject an ignored stats notice.
-33. Show a success toast.
+25. Combine the validated per-turn summaries with the previous native checkpoint. If the combined text exceeds 12,000 characters, merge it in a fresh temporary rollup session and enforce the hard cap.
+26. Arm a session-scoped native-writeback guard and call OpenCode's `session.summarize` endpoint with `auto = false`.
+27. During only that native commit, replace the compaction prompt with a minimal `READY` request and remove the historical transcript from the provider request through `experimental.chat.messages.transform`.
+28. Let OpenCode create its real user `CompactionPart` plus assistant message with `mode = "compaction"` and `summary = true`.
+29. Replace the native assistant's provider text with the exact prepared Magic Compact checkpoint and delete any extra reasoning/text parts, leaving one summary body inside one native compaction block.
+30. Clear the native-writeback guard in cleanup. Automatic preflight must ignore this guarded provider call.
+31. Update current session metadata with `compactionCount`.
+32. Measure the model-visible native checkpoint and retained tail rather than the complete durable transcript.
+33. Update stats, inject an ignored stats notice, and show a success toast.
 
 ## Trim Flow (Experimental)
 
@@ -103,12 +103,11 @@ Known issues: We do not check for noops.
 
 ## Recompaction
 
-- New per-turn summarization starts at the latest boundary marker; earlier turns are never redundantly summarized from raw transcript again.
-- After new summaries are committed, the pruning sweep revisits every summary-bearing turn across the complete session so historical tool structures cannot accumulate.
-- Detailed summaries are bounded: above 24 summaries, the oldest range is replaced by one historical rollup and the newest 16 remain detailed.
-- A later rollup may include the previous rollup, so repeated compaction converges to one bounded historical rollup plus a bounded detailed tail.
-- The boundary marker is a user text part with `metadata.magicCompact.boundary === true`.
-- Earlier turns before the latest boundary are outside the raw summarization range but remain eligible for pruning and rollup maintenance.
+- New per-turn preparation starts after the latest OpenCode user `CompactionPart`; earlier raw turns are not summarized again.
+- Legacy Magic Compact text boundaries remain recognized for migration.
+- The previous native `summary = true` assistant text is merged with newly prepared summaries, then bounded to a single 12,000-character checkpoint.
+- OpenCode retains the complete original transcript durably and projects only the latest native checkpoint plus its configured recent tail into model context.
+- Reverting the native compaction block restores OpenCode's ordinary transcript/revert behavior; the backup session remains a second recovery path.
 
 ## Summarization
 
@@ -126,24 +125,22 @@ Known issues: We do not check for noops.
 - A malformed non-empty first response is corrected with at most one additional prompt in a fresh, non-forked repair session. The repair prompt contains only the malformed output and required template while preserving the source model, agent, variant, provider, and data boundary.
 - Batch prompts contain a JSON projection of only their target turns from the already-trimmed ephemeral fork. Transcript content is explicitly treated as inert data.
 - Batches preserve complete turn boundaries, run sequentially, and carry at most the two most recent summaries forward as context.
-- Batch results are accumulated in memory and injected into the source only after every batch has produced the expected number of summaries.
+- Batch results are accumulated in memory and are not written into historical assistant messages.
 - Context-overflow failures recursively bisect multi-turn batches. A single oversized turn aborts safely and recommends OpenCode's native `/compact`.
 - The ignored progress notice moves through preparing, summarizing, XML repair, and applying phases. Batch progress advances only after XML for a complete turn range validates; active ranges reflect recursive splits. Progress-part update failures are non-fatal.
 - A malformed repair response aborts compaction and follows normal recovery behavior.
-- Each summary is written as a text part on the first assistant message in the summarized turn.
-- Summary parts use deterministic IDs: `prt_-magic_summary_${messageID}`.
-- Summary parts are marked with `metadata.magicCompact.summary === true`.
 - Per-turn summaries target at most 120 words unless critical state requires more.
-- Historical rollups target at most 1,200 words and have a 12,000-character hard cap.
-- Rollup prompts contain only prior summaries as inert JSON, run in fresh temporary sessions, and use the source model, agent, and variant.
+- The final native checkpoint targets at most 1,200 words and has a 12,000-character hard cap.
+- Oversized checkpoint rollups contain only prior/new summaries as inert JSON, run in fresh temporary sessions, and use the source model and variant.
+- The exact prepared checkpoint replaces the provider's native summary text after OpenCode creates the native block.
 
-## Boundary Notice
+## Native Writeback
 
-- OpenCode injects a synthetic user text part after summaries are written.
-- If a next user message exists, the notice is written onto that message and the part ID sorts before normal parts.
-- If no next user message exists, a no-reply synthetic user message is created.
-- The notice is marked with `metadata.magicCompact.boundary === true`.
-- The notice tells the model to use `read_omitted_content` only when exact omitted historical tool I/O is needed and cannot be recovered through a fresh tool call.
+- Native writeback is active only while `commitNativeCompaction` awaits `session.summarize` for one session ID.
+- The guarded native provider request receives no source transcript and produces only disposable readiness text.
+- The final assistant message is owned by OpenCode and has `summary === true`; Magic Compact updates only its parts after completion.
+- All parts except one exact prepared summary text part are deleted from that native summary assistant.
+- Ordinary native `/compact` calls are untouched because they have no Magic Compact writeback guard.
 
 ## Omission Cache
 
@@ -152,7 +149,7 @@ Known issues: We do not check for noops.
 - IDs are session-local sequential IDs: `omitted-001`, `omitted-002`, ...
 - The current session cache is the active cache on success.
 - The backup gets a cache copy before mutation.
-- Compaction and trimming share the same session-local omission sequence.
+- `/magic-trim` and legacy Magic Compact sessions use the session-local omission sequence. Native-block `/magic-compact` preserves the original transcript instead of copying it into omission storage.
 
 ## Omission Retrieval
 
@@ -181,7 +178,7 @@ Known issues: We do not check for noops.
 
 ### Accounting
 
-- Compaction: measure `beforeTokens` and `afterTokens` on the current session; add `max(0, beforeTokens - afterTokens)` to `totalTokensPruned`.
+- Compaction: measure provider usage before compaction and count only the model-visible native checkpoint/retained tail afterward; add `max(0, beforeTokens - afterTokens)` to `totalTokensPruned`.
 - Trim: count locally on the current session; add the reduction to `totalTokensPruned`. Trimming does not increment `compactionCount`.
 - Real-time: a `message.updated` event hook watches for completed assistant messages; for each, add `totalTokensPruned` to `cachedTokensSaved`, deduplicated by assistant message ID.
 
@@ -198,20 +195,13 @@ Known issues: We do not check for noops.
 
 ## Pruning
 
-- Pruning sweeps every summary-bearing turn after summary insertion and boundary injection, independent of the latest compaction boundary.
-- Synthetic user text parts are deleted unless they are preserved OpenCode wrappers or reminders.
-- Every historical tool part in a summarized turn is serialized exactly into one session-local omission entry before active-context deletion.
-- Summarized assistant messages keep only summary parts and compact archive notices.
-- Other assistant parts are deleted.
-- Assistant messages with no remaining parts are deleted.
-- Tool archive notices use deterministic IDs and retain the omission Content ID needed for exact local retrieval.
-- When detailed summaries exceed the rollup cap, replaced summary text and its archive notices are themselves serialized into a retrievable omission entry before deletion.
+- Native-block `/magic-compact` does not delete or rewrite historical transcript messages; OpenCode's compaction projection excludes them from model context.
 - `/magic-trim` applies only the tool rules below; it does not delete other user or assistant parts.
 - `/magic-trim` marks processed completed tool states as trimmed and skips them on later trims.
 
 ## Tool Rules
 
-The following state-level rules apply to `/magic-trim` and to disposable summary-fork shrinking. Successful `/magic-compact` ultimately archives and removes whole historical tool parts from active context after their semantic results have been summarized.
+The following state-level rules apply to `/magic-trim` and to disposable summary-fork shrinking. Native-block `/magic-compact` leaves the durable source tool parts intact.
 
 - `write`: omit large `input.content` and cache it.
 - `edit`: omit large `oldString` and `newString` together and cache once.

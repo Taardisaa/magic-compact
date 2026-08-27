@@ -6,7 +6,6 @@ import {
   createBackup,
   deleteProgressNotice,
   getCompactionCount,
-  injectPostCompactionNotice,
   injectProgressNotice,
   injectCompactStatsNotice,
   recordPruningStats,
@@ -15,8 +14,12 @@ import {
 } from "./compact/session";
 import type { CompactProgressReporter } from "./compact/progress";
 import { createCompactionPlan } from "./compact/plan";
-import { pruneCompactedHistory } from "./compact/prune";
-import { rollupCompactedSummaries } from "./compact/rollup";
+import {
+  buildNativeSummary,
+  commitNativeCompaction,
+  countNativeVisibleTokens,
+  needsNativeCompactionMigration,
+} from "./compact/native";
 import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
@@ -33,7 +36,10 @@ export async function executeMagicCompact(
   try {
     // Check if there's anything to compact
     const sourcePlan = await createCompactionPlan(v2, sessionID, keepTurns);
-    if (sourcePlan.summarizedTurns.length === 0) {
+    const migrationOnly =
+      sourcePlan.summarizedTurns.length === 0
+      && (await needsNativeCompactionMigration(v2, sessionID));
+    if (sourcePlan.summarizedTurns.length === 0 && !migrationOnly) {
       await v2.tui.showToast({
         title: "Magic Compact",
         message: COMPACT_NOOP,
@@ -60,43 +66,26 @@ export async function executeMagicCompact(
       (await getProviderTokens(v2, sessionID))
       ?? (await countSessionTokens(v2, sessionID));
 
-    const progressNotice = await injectProgressNotice(
+    const compacted = migrationOnly
+      ? { summaries: [], summarizedTurns: [] }
+      : await compactWithProgress(
+          v2,
+          sourceSession,
+          sessionID,
+          keepTurns,
+          sourcePlan.summarizedTurns.length,
+        );
+
+    const preparedSummary = await buildNativeSummary(
       v2,
+      sourceSession,
       sessionID,
-      sourcePlan.summarizedTurns.length,
+      compacted.summaries,
     );
-    const reportProgress: CompactProgressReporter = async update => {
-      try {
-        await updateProgressNotice(v2, sessionID, progressNotice, update);
-      } catch {
-        // Progress is best-effort UI state. A stale or unsupported part update
-        // must never roll back an otherwise valid compaction.
-      }
-    };
-    let compacted;
-    try {
-      // Compact current session
-      compacted = await compactSession(
-        v2,
-        sourceSession,
-        sessionID,
-        keepTurns,
-        reportProgress,
-      );
-    } finally {
-      await deleteProgressNotice(v2, sessionID, progressNotice);
-    }
-
-    // Mark the new compaction boundary for future recompactions
-    // Message placed outside of summarization range so unaffected by pruning
-    await injectPostCompactionNotice(v2, sessionID, compacted.nextTurn);
-
-    // Prune messages & tool calls
-    await pruneCompactedHistory({ v2, sessionID });
-    await rollupCompactedSummaries(v2, sourceSession, sessionID);
+    await commitNativeCompaction(v2, sourceSession, sessionID, preparedSummary);
 
     await updateCompactionMetadata(v2, sourceSession, currentCompactionCount);
-    const afterTokens = await countSessionTokens(v2, sessionID);
+    const afterTokens = await countNativeVisibleTokens(v2, sessionID);
     const stats = await recordPruningStats({
       sessionID,
       sourceSessionID: sessionID,
@@ -115,7 +104,9 @@ export async function executeMagicCompact(
 
     await v2.tui.showToast({
       title: "Magic Compact",
-      message: `Compacted ${compacted.summarizedTurns.length} assistant turn(s).`,
+      message: migrationOnly
+        ? "Migrated the previous Magic Compact output into one native compaction block."
+        : `Compacted ${compacted.summarizedTurns.length} assistant turn(s).`,
       variant: "info",
       duration: 5000,
     });
@@ -132,5 +123,34 @@ export async function executeMagicCompact(
       duration: 8000,
     });
     throw error;
+  }
+}
+
+async function compactWithProgress(
+  v2: V2Client,
+  sourceSession: Session,
+  sessionID: string,
+  keepTurns: number,
+  totalTurns: number,
+) {
+  const progressNotice = await injectProgressNotice(v2, sessionID, totalTurns);
+  const reportProgress: CompactProgressReporter = async update => {
+    try {
+      await updateProgressNotice(v2, sessionID, progressNotice, update);
+    } catch {
+      // Progress is best-effort UI state. A stale or unsupported part update
+      // must never roll back an otherwise valid compaction.
+    }
+  };
+  try {
+    return await compactSession(
+      v2,
+      sourceSession,
+      sessionID,
+      keepTurns,
+      reportProgress,
+    );
+  } finally {
+    await deleteProgressNotice(v2, sessionID, progressNotice);
   }
 }

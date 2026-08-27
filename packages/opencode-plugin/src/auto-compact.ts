@@ -8,6 +8,7 @@ import { unwrap, type V2Client } from "./api";
 import { executeMagicCompact } from "./magic-compact";
 import type { MessageWithParts } from "./compact/plan";
 import { isRecord } from "./util";
+import { isNativeCompactionPending } from "./compact/native";
 
 export const AUTO_COMPACT_THRESHOLD_RATIO = 0.85;
 
@@ -95,7 +96,11 @@ export class AutoCompactController {
     v2: V2Client,
     request: ProviderCallRequest,
   ): Promise<void> {
-    if (!this.enabled || this.compactAfterIdle.has(request.sessionID)) {
+    if (
+      !this.enabled
+      || this.compactAfterIdle.has(request.sessionID)
+      || isNativeCompactionPending(request.sessionID)
+    ) {
       return;
     }
 
@@ -391,6 +396,9 @@ async function waitForAssistantFinalization(
 
 function isInternalMagicCompactMessage(parts: Part[]): boolean {
   return parts.some(part => {
+    if (part.type === "compaction") {
+      return true;
+    }
     if (part.type !== "text" || !isRecord(part.metadata)) {
       return false;
     }

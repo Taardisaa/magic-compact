@@ -12,6 +12,10 @@ import { readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
 import { AutoCompactController } from "./auto-compact";
 import { isRecord } from "./util";
+import {
+  applyNativeCompactionPrompt,
+  stripNativeCompactionTranscript,
+} from "./compact/native";
 
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
@@ -55,6 +59,12 @@ const server: Plugin = async input => {
         sessionID: message.sessionID,
         model: message.model,
       });
+    },
+    "experimental.session.compacting": async (compacting, output) => {
+      applyNativeCompactionPrompt(compacting, output);
+    },
+    "experimental.chat.messages.transform": async (_input, output) => {
+      stripNativeCompactionTranscript(output);
     },
     "command.execute.before": async command => {
       if (command.command === STATS_COMMAND) {

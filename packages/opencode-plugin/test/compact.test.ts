@@ -211,11 +211,7 @@ describe("magic compact", () => {
     ]);
     expect(promptText(requests.prompts[1]!)).toContain("Summary for turn one.");
     expect(requests.deletes).toEqual(["batch-1", "batch-2", "ephemeral"]);
-    const injectedSummaries = requests.partUpdates
-      .map(request => request["part"] as TextPart)
-      .filter(part => part.metadata?.["magicCompact"] !== undefined)
-      .map(part => part.text);
-    expect(injectedSummaries).toEqual([
+    expect(requests.summaries).toEqual([
       "Summary for turn one.",
       "Summary for turn two.",
     ]);
@@ -397,6 +393,7 @@ type RequestLog = {
   partUpdates: Record<string, unknown>[];
   modelLimit?: { context: number; output: number };
   providerError?: MockProviderError;
+  summaries: string[];
 };
 
 type MockProviderError = {
@@ -480,7 +477,14 @@ async function runCompaction(
     },
   } as unknown as V2Client;
 
-  await compactSession(v2, sourceSession, "source", 0, reportProgress);
+  const result = await compactSession(
+    v2,
+    sourceSession,
+    "source",
+    0,
+    reportProgress,
+  );
+  requests.summaries = result.summaries;
   return requests;
 }
 
@@ -491,6 +495,7 @@ function requestLog(): RequestLog {
     creates: [],
     deletes: [],
     partUpdates: [],
+    summaries: [],
   };
 }
 

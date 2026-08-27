@@ -1,6 +1,5 @@
 import type { AssistantMessage, Session, TextPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { summaryMetadata, summaryPartID } from "./constants";
 import { createCompactionPlan, createTrimPlan, type Turn } from "./plan";
 import { trimToolPartsForSummary } from "./prune";
 import {
@@ -33,6 +32,7 @@ type SummaryBatch = {
 export type CompactSessionResult = {
   summarizedTurns: Turn[];
   nextTurn: Turn | null;
+  summaries: string[];
 };
 
 export async function compactSession(
@@ -62,11 +62,10 @@ export async function compactSession(
     completedTurns: plan.summarizedTurns.length,
     totalTurns: plan.summarizedTurns.length,
   });
-  await injectSummaries(v2, sessionID, plan.summarizedTurns, summaries);
-
   return {
     summarizedTurns: plan.summarizedTurns,
     nextTurn: plan.nextTurn,
+    summaries,
   };
 }
 
@@ -792,41 +791,4 @@ function extractSummaryXml(responseText: string): string {
     );
   }
   return responseText.slice(start, end + "</summary>".length);
-}
-
-async function injectSummaries(
-  v2: V2Client,
-  sessionID: string,
-  compactionTurns: Turn[],
-  summaries: string[],
-): Promise<void> {
-  for (const [index, turn] of compactionTurns.entries()) {
-    const summary = summaries[index];
-    if (summary === undefined) {
-      throw new Error("Missing summary for assistant turn.");
-    }
-
-    const firstAssistant = turn.assistants[0];
-    if (!firstAssistant) {
-      throw new Error("Turn missing assistant message.");
-    }
-
-    const part = {
-      id: summaryPartID(firstAssistant.info.id),
-      sessionID,
-      messageID: firstAssistant.info.id,
-      type: "text",
-      text: summary,
-      metadata: summaryMetadata(),
-    } satisfies TextPart;
-
-    unwrap(
-      await v2.part.update({
-        sessionID,
-        messageID: firstAssistant.info.id,
-        partID: part.id,
-        part,
-      }),
-    );
-  }
 }

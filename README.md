@@ -94,8 +94,8 @@ To compact, run `/magic-compact [N]` with an optional argument indicating how ma
 - The OpenCode progress notice updates in place as validated assistant-turn summaries finish, including the active turn range when batching or recursively splitting.
 - Batch summaries are applied atomically only after every batch succeeds. An isolated turn that cannot fit stops with an actionable native `/compact` fallback instead of partially modifying the conversation.
 - Malformed non-empty XML is repaired once in a fresh minimal session; provider errors and empty responses are not retried as formatting problems.
-- After a summary succeeds, complete historical tool parts are archived in local omission storage and removed from active model context. Their exact serialized transcript remains retrievable by Content ID.
-- Detailed summaries are bounded. When more than 24 exist, the oldest range becomes one dense historical rollup while the newest 16 stay detailed; the replaced summaries are archived locally for exact retrieval.
+- After preparation succeeds, Magic Compact commits through OpenCode's native compaction transaction. The UI receives one real compaction block with native revert behavior, while the original transcript remains durable.
+- Repeated checkpoints merge the prior native summary with new work and enforce a 12,000-character hard cap, so the active summary cannot grow without bound.
 
 Examples:
 
@@ -185,7 +185,7 @@ OpenCode-DCP is a runtime context management system that rewrites messages when 
 Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
-- Retrievable history — User commands remain in the session, while removed tool transcripts and rolled-up summary detail remain available in local omission storage.
+- Reversible history — OpenCode retains the original transcript and exposes Magic Compact as one native compaction block with native revert behavior.
 - Maximum token savings — The entire conversation is summarized with one request. Long tool calls are aggressively pruned.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.

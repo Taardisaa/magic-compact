@@ -28,10 +28,18 @@ export async function createCompactionPlan(
 ): Promise<CompactionPlan> {
   const turns = await loadTurns(v2, sessionID);
 
-  const boundaryTurnIndex = turns.findLastIndex(turn =>
+  const nativeBoundaryTurnIndex = turns.findLastIndex(turn =>
+    turn.user.some(msg => msg.parts.some(part => part.type === "compaction")),
+  );
+  const legacyBoundaryTurnIndex = turns.findLastIndex(turn =>
     turn.user.some(msg => msg.parts.some(isBoundaryPart)),
   );
-  const compactionStartIndex = boundaryTurnIndex === -1 ? 0 : boundaryTurnIndex;
+  const compactionStartIndex =
+    nativeBoundaryTurnIndex >= legacyBoundaryTurnIndex
+      ? nativeBoundaryTurnIndex + 1
+      : legacyBoundaryTurnIndex === -1
+        ? 0
+        : legacyBoundaryTurnIndex;
 
   removeTrailingAssistantlessTurn(turns);
 

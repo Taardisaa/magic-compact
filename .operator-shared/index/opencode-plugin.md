@@ -24,7 +24,7 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 - `index.ts` — Server entry; default-exports the plugin server
 - `tui.ts` — TUI plugin entry; default-exports the plugin
 - `api.ts` — V2 SDK client acquisition (`getV2Client`) and response unwrapping (`unwrap`)
-- `magic-compact.ts` — `/magic-compact` command executor
+- `magic-compact.ts` — `/magic-compact` preparation and native-writeback executor
 - `magic-trim.ts` — `/magic-trim` command executor
 - `magic-stats.ts` — `/magic-stats` command executor
 - `util.ts` — Small runtime guards (`isRecord`, `unwrapString`)
@@ -33,8 +33,9 @@ read_if: Working on the OpenCode plugin; read before exploring or modifying this
 
 - `plan.ts` — Turn model and `CompactionPlan` / `TrimPlan` planning
 - `compact.ts` — `compactSession` driver, temporary-fork budget guard, dynamic turn batching, recursive overflow splitting, isolated XML repair, and `CompactSessionResult`
+- `native.ts` — bounded checkpoint assembly, guarded native `session.summarize` commit, exact summary-part replacement, and model-visible token counting
 - `progress.ts` — Typed compaction progress phases, reporter contract, and in-place notice text formatting
-- `prune.ts` — `pruneSummarizedTurns`, persistent `trimToolParts`, and non-persistent temporary-fork trimming
+- `prune.ts` — persistent `trimToolParts`, legacy pruning helpers, and non-persistent temporary-fork trimming
 - `session.ts` — Backup create/apply, metadata, and progress-notice injection/update/deletion
 - `template.ts` — Compaction prompt builder (`buildCompactionPrompt`)
 - `constants.ts` — Post-compaction notice, boundary metadata, part-ID helpers
