@@ -10,14 +10,25 @@ import { STATS_SUCCESS, executeMagicStats } from "./magic-stats";
 import { TRIM_NOOP, TRIM_SUCCESS, executeMagicTrim } from "./magic-trim";
 import { readOmittedContent } from "./storage/omission";
 import { handleStatsEvent } from "./stats/events";
+import { AutoCompactController } from "./auto-compact";
+import { isRecord } from "./util";
 
 const COMPACT_COMMAND = "magic-compact";
 const TRIM_COMMAND = "magic-trim";
 const STATS_COMMAND = "magic-stats";
 
 const server: Plugin = async input => {
+  const autoCompact = new AutoCompactController();
+
   return {
     config: async config => {
+      // Explicitly disabling OpenCode's native auto-compaction hands automatic
+      // compaction ownership to Magic Compact.
+      const configRecord = config as unknown as Record<string, unknown>;
+      const compaction = configRecord["compaction"];
+      autoCompact.setEnabled(
+        isRecord(compaction) && compaction["auto"] === false,
+      );
       config.command ??= {};
       config.command[COMPACT_COMMAND] = {
         template: "",
@@ -31,6 +42,13 @@ const server: Plugin = async input => {
         template: "",
         description: "Trim historical tool inputs and outputs",
       };
+    },
+    "chat.message": async (message, output) => {
+      await autoCompact.beforeMessage(getV2Client(input), {
+        sessionID: message.sessionID,
+        model: output.message.model,
+        parts: output.parts,
+      });
     },
     "command.execute.before": async command => {
       if (command.command === STATS_COMMAND) {

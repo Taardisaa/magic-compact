@@ -32,7 +32,7 @@ The assistant's thought process, decisions, and actions remain in context along 
 ## Features
 
 - Lossless context compression — Fully preserve working memory instead of flattening history into one recap.
-- Zero compaction overhead — Compaction happens once on your command rather than during the agentic loop. Maximum token savings, minimal cache invalidations.
+- Manual by default — Compaction runs only on command unless OpenCode's native automatic compaction is explicitly handed over to Magic Compact.
 - Preserved user messages — Exact requirements and guidance remain visible to the agent, verbatim.
 - Smart tool call pruning — Bulky completed tool I/O is replaced with omission notices, with original content cached and retrievable on demand via `read_omitted_content`.
 - Recompactable — Run `/magic-compact` again later to compact new turns while preserving prior summaries.
@@ -69,6 +69,20 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 This installs the package and adds it to your global OpenCode config.
 
 ## Usage
+
+### Automatic takeover (OpenCode)
+
+To replace OpenCode's native automatic compaction with Magic Compact, explicitly disable the native implementation:
+
+```jsonc
+{
+  "compaction": {
+    "auto": false,
+  },
+}
+```
+
+With Magic Compact installed, this setting enables its pre-request takeover hook. The hook counts the stored session and pending user message locally, then runs Magic Compact before the request when it reaches `context - max(model output, 49,152 tokens)`. It never relies on stale provider token usage left on messages after in-place pruning. Omitting the setting or using `true` leaves Magic Compact manual and keeps OpenCode's native automatic compaction active.
 
 ### `/magic-compact`
 

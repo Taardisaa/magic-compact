@@ -52,6 +52,12 @@ function extractPartTexts(part: Part): string[] {
   }
 }
 
+export function countPartsTokens(parts: Part[]): number {
+  return parts
+    .map(part => countTextTokens(extractPartTexts(part).join("\n\n")))
+    .reduce((sum, count) => sum + count, 0);
+}
+
 export async function countSessionTokens(
   v2: V2Client,
   sessionID: string,
@@ -89,10 +95,7 @@ function estimateSystemPromptTokens(messages: MessageWithParts[]): number {
 }
 
 function countMessageGptTokens(message: MessageWithParts): number {
-  const count = message.parts.map(part =>
-    countTextTokens(extractPartTexts(part).join("\n\n")),
-  );
-  return count.reduce((sum, count) => sum + count, 0);
+  return countPartsTokens(message.parts);
 }
 
 // Most accurate for unmodified conversations. Do not use on modified conversations.

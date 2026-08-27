@@ -34,7 +34,7 @@ Magic Compact 不会把整段会话折叠成一个通用摘要,而是用高保�
 ## 特性
 
 - 无损上下文压缩 — 完整保留工作记忆,而不是把历史压平成一个回顾。
-- 零压缩开销 — 压缩在你下达命令时一次性完成,不发生在 agent 循环中。最大化 token 节省,最小化缓存失效。
+- 默认手动 — 除非在 OpenCode 中明确把原生自动压缩交给 Magic Compact,否则只会在你下达命令时运行。
 - 保留用户消息 — 确切的需求和指导逐字保留,助手始终可见。
 - 智能工具调用修剪 — 臃肿的已完成工具 I/O 被替换为省略提示,原始内容会被缓存,可通过 `read_omitted_content` 按需检索。
 - 可重新压缩 — 之后再次运行 `/magic-compact` 可压缩新的回合,同时保留之前的摘要。
@@ -71,6 +71,20 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 这会安装该包,并将其添加到你的全局 OpenCode 配置中。
 
 ## 用法
+
+### 自动接管(OpenCode)
+
+要用 Magic Compact 替换 OpenCode 原生自动压缩,请明确关闭原生实现:
+
+```jsonc
+{
+  "compaction": {
+    "auto": false,
+  },
+}
+```
+
+安装 Magic Compact 后,该设置会启用请求前接管 hook。插件会在本地计算已存储会话和待发送用户消息,达到 `context - max(模型输出上限,49,152 tokens)` 时先运行 Magic Compact。它不会依赖原地修剪后仍残留在历史消息上的旧 provider token usage。省略该设置或使用 `true` 时,Magic Compact 保持手动模式,OpenCode 原生自动压缩继续生效。
 
 ### `/magic-compact`
 
