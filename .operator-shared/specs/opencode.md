@@ -17,6 +17,8 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 - Automatic decisions never estimate context size from transcript text or the pending message. If authoritative provider usage is unavailable, the hook does not make an automatic compaction decision.
 - Compaction and trim notices invalidate older provider usage. A stored usage record is trusted only after the latest invalidation marker; legacy plugin notices are recognized for already-compacted sessions.
 - When provider-reported usage reaches the threshold, or the latest assistant record contains a structured provider context-overflow error, the hook runs `/magic-compact` behavior with `N = 0` before allowing the pending message to continue.
+- A `chat.params` preflight applies the same exact-usage check before every provider call, including automatic tool-loop continuations. Because the source session is busy at that point, it stops the model call, queues compaction, waits for the assistant row to finish persisting on `session.idle`, and then compacts.
+- A structured `session.error` `ContextOverflowError` also queues compaction for `session.idle`. Unstructured proxy text is never classified by string matching.
 - Magic Compact's internal progress, boundary, and stats messages and temporary summarization sessions never recursively trigger automatic compaction.
 - Concurrent automatic checks for the same session share one in-flight operation.
 - After compaction, the hook does not invent a replacement usage value. The next successful provider response becomes the new authoritative context snapshot. If no turns can be compacted, the pending request is stopped with an actionable error.

@@ -118,6 +118,64 @@ describe("automatic magic compact takeover", () => {
     expect(runtime.compactCalls).toBe(1);
   });
 
+  test("stops an internal provider continuation and compacts after session idle", async () => {
+    const runtime = mockRuntime([assistantUsage(85)]);
+    const controller = createEnabledController(runtime);
+
+    await expect(
+      controller.beforeProviderCall(runtime.v2, providerCall()),
+    ).rejects.toThrow("preflight stopped this model call");
+    expect(runtime.compactCalls).toBe(0);
+
+    await controller.handleEvent(runtime.v2, {
+      type: "session.idle",
+      properties: { sessionID: "source" },
+    });
+
+    expect(runtime.compactCalls).toBe(1);
+  });
+
+  test("queues structured context overflow for compaction on idle", async () => {
+    const runtime = mockRuntime([assistantWithoutUsage()]);
+    const controller = createEnabledController(runtime);
+
+    await controller.handleEvent(runtime.v2, {
+      type: "session.error",
+      properties: {
+        sessionID: "source",
+        error: { name: "ContextOverflowError" },
+      },
+    });
+    await controller.handleEvent(runtime.v2, {
+      type: "session.idle",
+      properties: { sessionID: "source" },
+    });
+
+    expect(runtime.compactCalls).toBe(1);
+  });
+
+  test("does not classify unstructured proxy text as context overflow", async () => {
+    const runtime = mockRuntime([assistantWithoutUsage()]);
+    const controller = createEnabledController(runtime);
+
+    await controller.handleEvent(runtime.v2, {
+      type: "session.error",
+      properties: {
+        sessionID: "source",
+        error: {
+          name: "APIError",
+          data: { message: "proxy upstream error: maximum context length" },
+        },
+      },
+    });
+    await controller.handleEvent(runtime.v2, {
+      type: "session.idle",
+      properties: { sessionID: "source" },
+    });
+
+    expect(runtime.compactCalls).toBe(0);
+  });
+
   test("ignores Magic Compact internal no-reply messages", async () => {
     const runtime = mockRuntime([assistantUsage(85)]);
     const controller = createEnabledController(runtime);
@@ -176,6 +234,13 @@ function request() {
     sessionID: "source",
     model: { providerID: "provider", modelID: "model" },
     parts: [textPart("pending")],
+  };
+}
+
+function providerCall() {
+  return {
+    sessionID: "source",
+    model: { limit: { context: 100, output: 20 } },
   };
 }
 

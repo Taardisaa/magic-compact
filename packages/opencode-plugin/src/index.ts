@@ -50,6 +50,12 @@ const server: Plugin = async input => {
         parts: output.parts,
       });
     },
+    "chat.params": async message => {
+      await autoCompact.beforeProviderCall(getV2Client(input), {
+        sessionID: message.sessionID,
+        model: message.model,
+      });
+    },
     "command.execute.before": async command => {
       if (command.command === STATS_COMMAND) {
         if (command.arguments.trim() !== "") {
@@ -94,8 +100,9 @@ const server: Plugin = async input => {
         throw new Error(didTrim ? TRIM_SUCCESS : TRIM_NOOP);
       }
     },
-    event: async input => {
-      await handleStatsEvent(input.event);
+    event: async eventInput => {
+      await handleStatsEvent(eventInput.event);
+      await autoCompact.handleEvent(getV2Client(input), eventInput.event);
     },
     tool: {
       read_omitted_content: tool({

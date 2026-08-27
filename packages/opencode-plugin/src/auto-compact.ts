@@ -19,6 +19,16 @@ type AutoCompactRequest = {
   parts: Part[];
 };
 
+type ProviderCallRequest = {
+  sessionID: string;
+  model: {
+    limit: {
+      context: number;
+      output: number;
+    };
+  };
+};
+
 type AutoCompactOptions = {
   bufferTokens?: number;
   compact?: typeof executeMagicCompact;
@@ -42,6 +52,7 @@ type AuthoritativeContextState =
 export class AutoCompactController {
   private enabled = false;
   private readonly inFlight = new Map<string, Promise<void>>();
+  private readonly compactAfterIdle = new Set<string>();
   private readonly bufferTokens: number;
   private readonly compact: typeof executeMagicCompact;
 
@@ -75,6 +86,107 @@ export class AutoCompactController {
       await operation;
     } finally {
       this.inFlight.delete(request.sessionID);
+    }
+  }
+
+  /**
+   * Guard every provider call, including automatic tool-loop continuations.
+   * Compaction cannot mutate a busy session safely, so crossing the exact
+   * provider-usage threshold stops this provider call and queues compaction
+   * for the ensuing idle event.
+   */
+  async beforeProviderCall(
+    v2: V2Client,
+    request: ProviderCallRequest,
+  ): Promise<void> {
+    if (!this.enabled || this.compactAfterIdle.has(request.sessionID)) {
+      return;
+    }
+
+    const sourceSession = unwrap(
+      await v2.session.get({ sessionID: request.sessionID }),
+    );
+    if (sourceSession.title.startsWith("[TEMP")) {
+      return;
+    }
+
+    const budget = budgetFromLimits(request.model.limit, this.bufferTokens);
+    const messages = unwrap(
+      await v2.session.messages({ sessionID: request.sessionID }),
+    ) as MessageWithParts[];
+    const context = getAuthoritativeContextState(sourceSession, messages);
+    if (
+      !context
+      || (context.kind === "usage" && context.tokens < budget.threshold)
+    ) {
+      return;
+    }
+
+    this.compactAfterIdle.add(request.sessionID);
+    const trigger =
+      context.kind === "overflow"
+        ? "the provider reported a context overflow"
+        : `${context.tokens.toLocaleString()} / ${budget.context.toLocaleString()} provider-reported tokens`;
+    await showToast(v2, {
+      message: `Stopping this model call before overflow: ${trigger}. Magic Compact will start when the session is idle.`,
+      variant: "info",
+    });
+    throw new Error("Magic Compact preflight stopped this model call.");
+  }
+
+  async handleEvent(v2: V2Client, event: unknown): Promise<void> {
+    if (!this.enabled || !isRecord(event)) {
+      return;
+    }
+
+    const type = event["type"];
+    const properties = event["properties"];
+    if (typeof type !== "string" || !isRecord(properties)) {
+      return;
+    }
+
+    const rawSessionID = properties["sessionID"];
+    const sessionID =
+      typeof rawSessionID === "string" ? rawSessionID : undefined;
+    const error = properties["error"];
+    if (
+      type === "session.error"
+      && sessionID
+      && isRecord(error)
+      && error["name"] === "ContextOverflowError"
+    ) {
+      this.compactAfterIdle.add(sessionID);
+      return;
+    }
+
+    if (
+      type !== "session.idle"
+      || !sessionID
+      || !this.compactAfterIdle.delete(sessionID)
+    ) {
+      return;
+    }
+
+    try {
+      await waitForAssistantFinalization(v2, sessionID);
+      const sourceSession = unwrap(await v2.session.get({ sessionID }));
+      if (sourceSession.title.startsWith("[TEMP")) {
+        return;
+      }
+
+      const compacted = await this.compact(v2, sessionID, 0);
+      if (!compacted) {
+        await showToast(v2, {
+          message:
+            "Automatic compaction was queued, but no completed assistant turns are available to compact.",
+          variant: "error",
+        });
+      }
+    } catch (error) {
+      await showToast(v2, {
+        message: `Queued automatic compaction failed: ${String(error)}`,
+        variant: "error",
+      });
     }
   }
 
@@ -249,14 +361,45 @@ async function getAutoCompactBudget(
       return null;
     }
 
-    const reserved = Math.max(bufferTokens, model.limit.output);
-    return {
-      context,
-      threshold: Math.max(1, context - reserved),
-    };
+    return budgetFromLimits(model.limit, bufferTokens);
   } catch {
     return null;
   }
+}
+
+function budgetFromLimits(
+  limit: { context: number; output: number },
+  bufferTokens: number,
+): AutoCompactBudget {
+  const reserved = Math.max(bufferTokens, limit.output);
+  return {
+    context: limit.context,
+    threshold: Math.max(1, limit.context - reserved),
+  };
+}
+
+async function waitForAssistantFinalization(
+  v2: V2Client,
+  sessionID: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const messages = unwrap(
+      await v2.session.messages({ sessionID }),
+    ) as MessageWithParts[];
+    const lastAssistant = messages.findLast(
+      message => message.info.role === "assistant",
+    );
+    if (
+      !lastAssistant
+      || (lastAssistant.info.role === "assistant"
+        && lastAssistant.info.time.completed)
+    ) {
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+
+  throw new Error("session did not finish persisting its assistant message");
 }
 
 function isInternalMagicCompactMessage(parts: Part[]): boolean {
