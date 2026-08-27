@@ -70,6 +70,19 @@ describe("automatic magic compact takeover", () => {
     expect(runtime.compactCalls).toBe(0);
   });
 
+  test("skips completed zero-usage proxy failures and uses the latest positive provider usage", async () => {
+    const runtime = mockRuntime([
+      assistantUsage(85, 1),
+      assistantWithoutUsage(2),
+      assistantWithoutUsage(3),
+    ]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, request());
+
+    expect(runtime.compactCalls).toBe(1);
+  });
+
   test("ignores an unfinished zero-usage row and uses the latest completed provider usage", async () => {
     const unfinished = assistantWithoutUsage(2);
     if (unfinished.info.role === "assistant") {

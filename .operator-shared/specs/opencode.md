@@ -12,7 +12,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 ## Automatic Takeover
 
 - Setting OpenCode's `compaction.auto` to `false` explicitly transfers automatic compaction ownership to Magic Compact.
-- Before each ordinary user message is sent, the `chat.message` hook reads the latest completed assistant usage that OpenCode persisted from the provider. Unfinished zero-usage rows are skipped.
+- Before each ordinary user message is sent, the `chat.message` hook reads the latest completed, positive assistant usage that OpenCode persisted from the provider. Unfinished and zero-usage rows are skipped; some OpenAI-compatible proxies persist rejected requests as completed zero-usage assistant rows without a structured error.
 - The automatic threshold is `model context - max(model output limit, 49,152 tokens)`.
 - Automatic decisions never estimate context size from transcript text or the pending message. If authoritative provider usage is unavailable, the hook does not make an automatic compaction decision.
 - Compaction and trim notices invalidate older provider usage. A stored usage record is trusted only after the latest invalidation marker; legacy plugin notices are recognized for already-compacted sessions.

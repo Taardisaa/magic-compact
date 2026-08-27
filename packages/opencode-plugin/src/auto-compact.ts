@@ -170,9 +170,14 @@ export function getAuthoritativeContextState(
       return { kind: "usage", tokens };
     }
 
-    return assistant.error?.name === "ContextOverflowError"
-      ? { kind: "overflow" }
-      : null;
+    if (assistant.error?.name === "ContextOverflowError") {
+      return { kind: "overflow" };
+    }
+
+    // Some OpenAI-compatible proxies finish rejected requests with a zeroed
+    // usage record and no structured error. Zero is not provider usage, so
+    // continue to the latest positive provider snapshot after the mutation
+    // barrier. That snapshot is an authoritative lower bound, not an estimate.
   }
 
   return null;
