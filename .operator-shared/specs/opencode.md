@@ -36,7 +36,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 6. Copy omission and stats caches to the backup.
 7. Rename the backup to `[Backup] ${title} ${timestamp}` and write backup metadata.
 8. Measure pre-compaction tokens using provider tokens when available, otherwise local counting.
-9. Insert an ignored no-reply progress message and retain its text-part handle for in-place updates.
+9. Publish a long-lived top-right TUI toast for live progress without inserting a transcript message.
 10. Fork the source session into an ephemeral compaction session so the summarizer sees the full conversation.
 11. In the ephemeral fork only, trim large completed tool inputs and outputs without writing omission-cache records.
 12. When model limits are available, estimate the pruned request size.
@@ -46,12 +46,12 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 16. If a batch receives a provider context-overflow error, recursively split it at a turn boundary and retry each half.
 17. Abort with an actionable error if one isolated turn still cannot fit.
 18. Abort immediately on other provider errors; do not misclassify them as malformed XML.
-19. Parse and accumulate per-turn summaries without mutating the source session. Update the same progress part after each validated batch or recursively split range, reporting completed assistant turns out of the total.
+19. Parse and accumulate per-turn summaries without mutating the source session. Publish a replacement progress toast after each validated batch or recursively split range, reporting completed assistant turns out of the total.
 20. If a non-empty response has malformed XML, create a fresh, non-forked repair session containing only the malformed response and strict XML template.
 21. Send at most one repair request, parse it, and delete the repair session in cleanup.
 22. Abort if the single repair attempt also fails.
 23. Delete every batch, repair, and ephemeral session in cleanup.
-24. Delete the progress message in cleanup.
+24. Replace the progress toast with the final success or failure toast.
 25. Combine the validated per-turn summaries with the previous native checkpoint. If the combined text exceeds 12,000 characters, merge it in a fresh temporary rollup session and enforce the hard cap.
 26. Arm a session-scoped native-writeback guard and call OpenCode's `session.summarize` endpoint with `auto = false`.
 27. During only that native commit, replace the compaction prompt with a minimal `READY` request and remove the historical transcript from the provider request through `experimental.chat.messages.transform`.
@@ -127,7 +127,7 @@ Known issues: We do not check for noops.
 - Batches preserve complete turn boundaries, run sequentially, and carry at most the two most recent summaries forward as context.
 - Batch results are accumulated in memory and are not written into historical assistant messages.
 - Context-overflow failures recursively bisect multi-turn batches. A single oversized turn aborts safely and recommends OpenCode's native `/compact`.
-- The ignored progress notice moves through preparing, summarizing, XML repair, and applying phases. Batch progress advances only after XML for a complete turn range validates; active ranges reflect recursive splits. Progress-part update failures are non-fatal.
+- The top-right progress toast moves through preparing, summarizing, XML repair, and applying phases. Batch progress advances only after XML for a complete turn range validates; active ranges reflect recursive splits. Toast publishing failures are non-fatal. The final native compaction block is written once and remains static.
 - A malformed repair response aborts compaction and follows normal recovery behavior.
 - Per-turn summaries target at most 120 words unless critical state requires more.
 - The final native checkpoint targets at most 1,200 words and has a 12,000-character hard cap.
@@ -217,7 +217,7 @@ The following state-level rules apply to `/magic-trim` and to disposable summary
 ## Error Handling
 
 - Any LLM, XML, SDK, cache, stats, token counting, or pruning failure aborts the attempt.
-- Cleanup deletes the ephemeral session and progress message when they exist.
+- Cleanup deletes ephemeral summarization sessions when they exist; progress lives only in transient TUI toast state.
 - If a backup exists, it is promoted back.
 - A failure toast is shown.
 - The command hook throws so OpenCode does not continue sending the slash command to the LLM.

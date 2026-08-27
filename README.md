@@ -91,7 +91,7 @@ To compact, run `/magic-compact [N]` with an optional argument indicating how ma
 - `N` is the number of recent assistant turns to preserve as-is. Default: `0` (summarize everything).
 - A backup session is created before the current conversation is compacted. If compaction fails, you will return to the backup.
 - On OpenCode, a disposable fork trims bulky tool I/O before the summary request. If the pruned request still cannot fit, complete turns are summarized in dynamically sized batches; overflowing multi-turn batches are recursively split.
-- The OpenCode progress notice updates in place as validated assistant-turn summaries finish, including the active turn range when batching or recursively splitting.
+- OpenCode keeps the final native compaction block static. Live progress is emitted as a top-right TUI toast that updates after each validated batch, including the active turn range when batching or recursively splitting.
 - Batch summaries are applied atomically only after every batch succeeds. An isolated turn that cannot fit stops with an actionable native `/compact` fallback instead of partially modifying the conversation.
 - Malformed non-empty XML is repaired once in a fresh minimal session; provider errors and empty responses are not retried as formatting problems.
 - After preparation succeeds, Magic Compact commits through OpenCode's native compaction transaction. The UI receives one real compaction block with native revert behavior, while the original transcript remains durable.

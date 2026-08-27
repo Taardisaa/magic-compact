@@ -1,3 +1,5 @@
+import type { V2Client } from "../api";
+
 export type CompactProgressPhase =
   | "preparing"
   | "summarizing"
@@ -28,5 +30,19 @@ export function formatCompactProgress(update: CompactProgressUpdate): string {
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
   const detail = update.detail ? ` · ${update.detail}` : "";
 
-  return `Magic Compact: ${PHASE_LABELS[update.phase]} · ${completed}/${total} assistant turns (${percent}%)${detail}`;
+  return `${PHASE_LABELS[update.phase]} · ${completed}/${total} assistant turns (${percent}%)${detail}`;
+}
+
+export async function showCompactProgressToast(
+  v2: V2Client,
+  update: CompactProgressUpdate,
+): Promise<void> {
+  await v2.tui.showToast({
+    title: "Magic Compact",
+    message: formatCompactProgress(update),
+    variant: "info",
+    // Each progress event replaces the current toast. A long duration keeps
+    // slow provider batches visible until the next event arrives.
+    duration: 3_600_000,
+  });
 }

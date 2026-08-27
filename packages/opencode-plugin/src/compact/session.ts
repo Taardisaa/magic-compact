@@ -14,17 +14,11 @@ import {
   statsMessage,
   trimStatsMessage,
 } from "../stats/constants";
-import { formatCompactProgress, type CompactProgressUpdate } from "./progress";
 
 export type MagicCompactMetadata = {
   sourceSessionId?: string;
   compactedAt?: number;
   compactionCount: number;
-};
-
-export type ProgressNotice = {
-  messageID: string;
-  part: TextPart;
 };
 
 export async function createBackup(
@@ -68,80 +62,6 @@ export async function applyBackup(
   await v2.tui.selectSession({
     sessionID: backupSession.id,
   });
-}
-
-export async function injectProgressNotice(
-  v2: V2Client,
-  sessionID: string,
-  totalTurns: number,
-): Promise<ProgressNotice> {
-  const message = unwrap(
-    await v2.session.prompt({
-      sessionID,
-      noReply: true,
-      parts: [
-        {
-          type: "text",
-          text: formatCompactProgress({
-            phase: "preparing",
-            completedTurns: 0,
-            totalTurns,
-          }),
-          ignored: true,
-          metadata: {
-            magicCompact: {
-              progress: true,
-            },
-          },
-        },
-      ],
-    }),
-  );
-
-  const part = message.parts.find(
-    (candidate): candidate is TextPart => candidate.type === "text",
-  );
-  if (!part) {
-    throw new Error("Magic Compact progress notice has no text part.");
-  }
-
-  return { messageID: message.info.id, part };
-}
-
-export async function updateProgressNotice(
-  v2: V2Client,
-  sessionID: string,
-  notice: ProgressNotice,
-  update: CompactProgressUpdate,
-): Promise<void> {
-  const part: TextPart = {
-    ...notice.part,
-    sessionID,
-    messageID: notice.messageID,
-    text: formatCompactProgress(update),
-  };
-
-  notice.part = unwrap(
-    await v2.part.update({
-      sessionID,
-      messageID: notice.messageID,
-      partID: part.id,
-      part,
-    }),
-  ) as TextPart;
-}
-
-export async function deleteProgressNotice(
-  v2: V2Client,
-  sessionID: string,
-  notice: ProgressNotice,
-): Promise<void> {
-  unwrap(
-    await v2.session.deleteMessage({
-      sessionID,
-      messageID: notice.messageID,
-    }),
-  );
 }
 
 export function getCompactionCount(session: Session): number {

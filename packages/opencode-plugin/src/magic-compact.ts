@@ -4,15 +4,15 @@ import { compactSession } from "./compact/compact";
 import {
   applyBackup,
   createBackup,
-  deleteProgressNotice,
   getCompactionCount,
-  injectProgressNotice,
   injectCompactStatsNotice,
   recordPruningStats,
   updateCompactionMetadata,
-  updateProgressNotice,
 } from "./compact/session";
-import type { CompactProgressReporter } from "./compact/progress";
+import {
+  showCompactProgressToast,
+  type CompactProgressReporter,
+} from "./compact/progress";
 import { createCompactionPlan } from "./compact/plan";
 import {
   buildNativeSummary,
@@ -133,24 +133,24 @@ async function compactWithProgress(
   keepTurns: number,
   totalTurns: number,
 ) {
-  const progressNotice = await injectProgressNotice(v2, sessionID, totalTurns);
+  await showCompactProgressToast(v2, {
+    phase: "preparing",
+    completedTurns: 0,
+    totalTurns,
+  }).catch(() => undefined);
   const reportProgress: CompactProgressReporter = async update => {
     try {
-      await updateProgressNotice(v2, sessionID, progressNotice, update);
+      await showCompactProgressToast(v2, update);
     } catch {
-      // Progress is best-effort UI state. A stale or unsupported part update
-      // must never roll back an otherwise valid compaction.
+      // Progress is best-effort TUI state and must never roll back an
+      // otherwise valid compaction.
     }
   };
-  try {
-    return await compactSession(
-      v2,
-      sourceSession,
-      sessionID,
-      keepTurns,
-      reportProgress,
-    );
-  } finally {
-    await deleteProgressNotice(v2, sessionID, progressNotice);
-  }
+  return compactSession(
+    v2,
+    sourceSession,
+    sessionID,
+    keepTurns,
+    reportProgress,
+  );
 }
