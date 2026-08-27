@@ -17,8 +17,8 @@ import {
 import { formatCompactProgress, type CompactProgressUpdate } from "./progress";
 
 export type MagicCompactMetadata = {
-  sourceSessionId: string;
-  compactedAt: number;
+  sourceSessionId?: string;
+  compactedAt?: number;
   compactionCount: number;
 };
 
@@ -187,6 +187,8 @@ export async function updateCompactionMetadata(
       metadata: {
         ...session.metadata,
         magicCompact: {
+          ...(session.metadata?.magicCompact as Record<string, unknown>),
+          compactedAt: Date.now(),
           compactionCount,
         },
       },
@@ -282,7 +284,12 @@ export async function injectCompactStatsNotice(
             modelID,
           ),
           ignored: true,
-          metadata: STATS_METADATA,
+          metadata: {
+            magicCompact: {
+              ...STATS_METADATA.magicCompact,
+              invalidatesProviderUsage: true,
+            },
+          },
         },
       ],
     }),
@@ -306,7 +313,12 @@ export async function injectTrimStatsNotice(
           type: "text",
           text: trimStatsMessage(beforeTokens, afterTokens, stats, modelID),
           ignored: true,
-          metadata: STATS_METADATA,
+          metadata: {
+            magicCompact: {
+              ...STATS_METADATA.magicCompact,
+              invalidatesProviderUsage: true,
+            },
+          },
         },
       ],
     }),

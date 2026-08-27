@@ -1,16 +1,19 @@
 import { describe, expect, test } from "bun:test";
-import type { Message, Session, TextPart } from "@opencode-ai/sdk/v2";
+import type {
+  AssistantMessage,
+  Message,
+  Session,
+  TextPart,
+  UserMessage,
+} from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import { AutoCompactController } from "../src/auto-compact";
 import type { MessageWithParts } from "../src/compact/plan";
 
 describe("automatic magic compact takeover", () => {
   test("stays disabled unless native auto-compaction is explicitly handed off", async () => {
-    const runtime = mockRuntime(true);
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
+    const runtime = mockRuntime([assistantUsage(85)]);
+    const controller = createController(runtime);
 
     await controller.beforeMessage(runtime.v2, request());
 
@@ -18,42 +21,93 @@ describe("automatic magic compact takeover", () => {
     expect(runtime.compactCalls).toBe(0);
   });
 
-  test("compacts before a pending message when the local estimate reaches the safe threshold", async () => {
-    const runtime = mockRuntime(true);
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
+  test("compacts from provider-reported usage at the safe threshold", async () => {
+    const runtime = mockRuntime([assistantUsage(85)]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, request());
+
+    expect(runtime.compactCalls).toBe(1);
+    expect(runtime.messageGets).toBe(1);
+    expect(runtime.toasts[0]?.message).toContain(
+      "85 / 100 provider-reported tokens",
+    );
+  });
+
+  test("does not compact below threshold even when transcript and pending text are large", async () => {
+    const runtime = mockRuntime([
+      userMessage("word ".repeat(1_000), 1),
+      assistantUsage(79, 2),
+    ]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, {
+      ...request(),
+      parts: [textPart("pending ".repeat(1_000))],
     });
-    controller.setEnabled(true);
+
+    expect(runtime.compactCalls).toBe(0);
+  });
+
+  test("compacts after a structured provider context-overflow error", async () => {
+    const runtime = mockRuntime([assistantOverflow()]);
+    const controller = createEnabledController(runtime);
 
     await controller.beforeMessage(runtime.v2, request());
 
     expect(runtime.compactCalls).toBe(1);
     expect(runtime.toasts[0]?.message).toContain(
-      "Automatic Magic Compact triggered",
+      "provider reported a context overflow",
     );
   });
 
-  test("does not compact while the locally counted context is below threshold", async () => {
-    const runtime = mockRuntime(false);
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
-    controller.setEnabled(true);
+  test("does not guess when the latest assistant has no authoritative usage", async () => {
+    const runtime = mockRuntime([assistantWithoutUsage()]);
+    const controller = createEnabledController(runtime);
 
     await controller.beforeMessage(runtime.v2, request());
 
     expect(runtime.compactCalls).toBe(0);
   });
 
+  test("ignores an unfinished zero-usage row and uses the latest completed provider usage", async () => {
+    const unfinished = assistantWithoutUsage(2);
+    if (unfinished.info.role === "assistant") {
+      delete unfinished.info.time.completed;
+    }
+    const runtime = mockRuntime([assistantUsage(85, 1), unfinished]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, request());
+
+    expect(runtime.compactCalls).toBe(1);
+  });
+
+  test("does not reuse provider usage invalidated by compaction", async () => {
+    const runtime = mockRuntime([assistantUsage(95, 1), mutationNotice(2)]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, request());
+
+    expect(runtime.compactCalls).toBe(0);
+  });
+
+  test("uses fresh provider usage recorded after compaction", async () => {
+    const runtime = mockRuntime([
+      assistantUsage(95, 1),
+      mutationNotice(2),
+      assistantUsage(85, 3),
+    ]);
+    const controller = createEnabledController(runtime);
+
+    await controller.beforeMessage(runtime.v2, request());
+
+    expect(runtime.compactCalls).toBe(1);
+  });
+
   test("ignores Magic Compact internal no-reply messages", async () => {
-    const runtime = mockRuntime(true);
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
-    controller.setEnabled(true);
+    const runtime = mockRuntime([assistantUsage(85)]);
+    const controller = createEnabledController(runtime);
 
     await controller.beforeMessage(runtime.v2, {
       ...request(),
@@ -69,49 +123,40 @@ describe("automatic magic compact takeover", () => {
   });
 
   test("ignores temporary summarization sessions", async () => {
-    const runtime = mockRuntime(true, "[TEMP SUMMARY BATCH 1] Test");
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
-    controller.setEnabled(true);
+    const runtime = mockRuntime(
+      [assistantUsage(85)],
+      "[TEMP SUMMARY BATCH 1] Test",
+    );
+    const controller = createEnabledController(runtime);
 
     await controller.beforeMessage(runtime.v2, request());
 
     expect(runtime.compactCalls).toBe(0);
   });
 
-  test("blocks the provider request when compaction cannot free enough context", async () => {
-    const runtime = mockRuntime(true);
-    runtime.keepLargeAfterCompaction = true;
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
-    controller.setEnabled(true);
-
-    await expect(
-      controller.beforeMessage(runtime.v2, request()),
-    ).rejects.toThrow("pending request was stopped");
-
-    expect(runtime.compactCalls).toBe(1);
-    expect(runtime.toasts.at(-1)?.variant).toBe("error");
-  });
-
   test("blocks the provider request when no completed turn can be compacted", async () => {
-    const runtime = mockRuntime(true);
+    const runtime = mockRuntime([assistantUsage(85)]);
     runtime.compactResult = false;
-    const controller = new AutoCompactController({
-      bufferTokens: 20,
-      compact: runtime.compact,
-    });
-    controller.setEnabled(true);
+    const controller = createEnabledController(runtime);
 
     await expect(
       controller.beforeMessage(runtime.v2, request()),
     ).rejects.toThrow("No completed assistant turns");
   });
 });
+
+function createController(runtime: ReturnType<typeof mockRuntime>) {
+  return new AutoCompactController({
+    bufferTokens: 20,
+    compact: runtime.compact,
+  });
+}
+
+function createEnabledController(runtime: ReturnType<typeof mockRuntime>) {
+  const controller = createController(runtime);
+  controller.setEnabled(true);
+  return controller;
+}
 
 function request() {
   return {
@@ -121,19 +166,17 @@ function request() {
   };
 }
 
-function mockRuntime(startsLarge: boolean, title = "Test session") {
+function mockRuntime(messages: MessageWithParts[], title = "Test session") {
   const state = {
     compactCalls: 0,
     compactResult: true,
-    compacted: false,
-    keepLargeAfterCompaction: false,
+    messageGets: 0,
     sessionGets: 0,
     toasts: [] as { message: string; variant: string }[],
   };
 
   const compact = async () => {
     state.compactCalls += 1;
-    state.compacted = true;
     return state.compactResult;
   };
 
@@ -141,19 +184,17 @@ function mockRuntime(startsLarge: boolean, title = "Test session") {
     session: {
       get: async () => {
         state.sessionGets += 1;
-        return { data: { id: "source", title } as Session };
+        return {
+          data: {
+            id: "source",
+            title,
+            metadata: {},
+          } as Session,
+        };
       },
       messages: async () => {
-        const large =
-          startsLarge && (!state.compacted || state.keepLargeAfterCompaction);
-        return {
-          data: [
-            {
-              info: { id: "user", role: "user" } as Message,
-              parts: [textPart(large ? "word ".repeat(120) : "short")],
-            },
-          ] as MessageWithParts[],
-        };
+        state.messageGets += 1;
+        return { data: messages };
       },
     },
     provider: {
@@ -181,6 +222,81 @@ function mockRuntime(startsLarge: boolean, title = "Test session") {
   } as unknown as V2Client;
 
   return Object.assign(state, { compact, v2 });
+}
+
+function assistantUsage(tokens: number, created = 1): MessageWithParts {
+  return {
+    info: {
+      id: `assistant-${created}`,
+      sessionID: "source",
+      role: "assistant",
+      time: { created, completed: created },
+      parentID: "user",
+      modelID: "model",
+      providerID: "provider",
+      mode: "build",
+      agent: "build",
+      path: { cwd: "C:/workspace", root: "C:/workspace" },
+      cost: 0,
+      tokens: {
+        input: tokens,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      },
+    } as AssistantMessage,
+    parts: [],
+  };
+}
+
+function assistantOverflow(created = 1): MessageWithParts {
+  const message = assistantUsage(0, created);
+  if (message.info.role === "assistant") {
+    message.info.error = {
+      name: "ContextOverflowError",
+      data: { message: "Provider rejected the request as too large." },
+    };
+  }
+  return message;
+}
+
+function assistantWithoutUsage(created = 1): MessageWithParts {
+  return assistantUsage(0, created);
+}
+
+function userMessage(text: string, created: number): MessageWithParts {
+  return {
+    info: {
+      id: `user-${created}`,
+      sessionID: "source",
+      role: "user",
+      time: { created },
+      agent: "build",
+      model: { providerID: "provider", modelID: "model" },
+    } as UserMessage,
+    parts: [textPart(text)],
+  };
+}
+
+function mutationNotice(created: number): MessageWithParts {
+  return {
+    info: {
+      id: `mutation-${created}`,
+      sessionID: "source",
+      role: "user",
+      time: { created },
+      agent: "build",
+      model: { providerID: "provider", modelID: "model" },
+    } as Message,
+    parts: [
+      textPart("Magic Compaction #1\nCompaction Stats", {
+        magicCompact: {
+          stats: true,
+          invalidatesProviderUsage: true,
+        },
+      }),
+    ],
+  };
 }
 
 function textPart(text: string, metadata?: Record<string, unknown>): TextPart {

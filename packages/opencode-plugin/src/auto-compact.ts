@@ -1,7 +1,12 @@
-import type { Part, UserMessage } from "@opencode-ai/sdk/v2";
+import type {
+  AssistantMessage,
+  Part,
+  Session,
+  UserMessage,
+} from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "./api";
 import { executeMagicCompact } from "./magic-compact";
-import { countPartsTokens, countSessionTokens } from "./stats/tokenize";
+import type { MessageWithParts } from "./compact/plan";
 import { isRecord } from "./util";
 
 export const DEFAULT_AUTO_COMPACT_BUFFER_TOKENS = 49_152;
@@ -24,10 +29,15 @@ type AutoCompactBudget = {
   threshold: number;
 };
 
+type AuthoritativeContextState =
+  | { kind: "usage"; tokens: number }
+  | { kind: "overflow" };
+
 /**
  * Takes over automatic compaction only when OpenCode's native auto-compaction
  * has been explicitly disabled. The decision is based on the currently stored
- * parts rather than stale provider usage attached to historical messages.
+ * provider usage persisted by OpenCode. It never estimates context size from
+ * transcript text.
  */
 export class AutoCompactController {
   private enabled = false;
@@ -88,15 +98,25 @@ export class AutoCompactController {
       return;
     }
 
-    const pendingTokens = countPartsTokens(request.parts);
-    const estimatedTokens =
-      (await countSessionTokens(v2, request.sessionID)) + pendingTokens;
-    if (estimatedTokens < budget.threshold) {
+    const messages = unwrap(
+      await v2.session.messages({ sessionID: request.sessionID }),
+    ) as MessageWithParts[];
+    const context = getAuthoritativeContextState(sourceSession, messages);
+    if (!context) {
       return;
     }
 
+    if (context.kind === "usage" && context.tokens < budget.threshold) {
+      return;
+    }
+
+    const trigger =
+      context.kind === "overflow"
+        ? "the provider reported a context overflow"
+        : `${context.tokens.toLocaleString()} / ${budget.context.toLocaleString()} provider-reported tokens`;
+
     await showToast(v2, {
-      message: `Automatic Magic Compact triggered at ~${estimatedTokens.toLocaleString()} / ${budget.context.toLocaleString()} tokens.`,
+      message: `Automatic Magic Compact triggered: ${trigger}.`,
       variant: "info",
     });
 
@@ -107,16 +127,105 @@ export class AutoCompactController {
         "No completed assistant turns are available to compact.",
       );
     }
-
-    const remainingTokens =
-      (await countSessionTokens(v2, request.sessionID)) + pendingTokens;
-    if (remainingTokens >= budget.threshold) {
-      await failAutoCompaction(
-        v2,
-        `Context remains at ~${remainingTokens.toLocaleString()} tokens after compaction; the pending request was stopped to avoid provider overflow.`,
-      );
-    }
   }
+}
+
+/**
+ * Return only context state that OpenCode persisted from the provider.
+ *
+ * In-place compaction and trimming invalidate older usage snapshots. Mutation
+ * notices form an exact ordering barrier: an assistant usage record is trusted
+ * only when it occurs after the latest barrier. Legacy notices are recognized
+ * by their plugin-owned text so already-compacted sessions migrate safely.
+ */
+export function getAuthoritativeContextState(
+  session: Session,
+  messages: MessageWithParts[],
+): AuthoritativeContextState | null {
+  const barrierIndex = messages.findLastIndex(isContextMutationNotice);
+  const compactedAt = getCompactedAt(session);
+
+  for (let index = messages.length - 1; index > barrierIndex; index -= 1) {
+    const message = messages[index];
+    if (!message || message.info.role !== "assistant") {
+      continue;
+    }
+
+    const assistant = message.info;
+    if (!assistant.time.completed) {
+      continue;
+    }
+
+    const recordedAt = assistant.time.completed;
+    if (
+      barrierIndex === -1
+      && compactedAt !== null
+      && recordedAt <= compactedAt
+    ) {
+      return null;
+    }
+
+    const tokens = providerContextTokens(assistant);
+    if (tokens > 0) {
+      return { kind: "usage", tokens };
+    }
+
+    return assistant.error?.name === "ContextOverflowError"
+      ? { kind: "overflow" }
+      : null;
+  }
+
+  return null;
+}
+
+function providerContextTokens(message: AssistantMessage): number {
+  if (message.tokens.total && message.tokens.total > 0) {
+    return message.tokens.total;
+  }
+
+  return (
+    message.tokens.input
+    + message.tokens.output
+    + message.tokens.reasoning
+    + message.tokens.cache.read
+    + message.tokens.cache.write
+  );
+}
+
+function getCompactedAt(session: Session): number | null {
+  const magicCompact = session.metadata?.["magicCompact"];
+  if (!isRecord(magicCompact)) {
+    return null;
+  }
+
+  const compactedAt = magicCompact["compactedAt"];
+  return typeof compactedAt === "number" ? compactedAt : null;
+}
+
+function isContextMutationNotice(message: MessageWithParts): boolean {
+  if (message.info.role !== "user") {
+    return false;
+  }
+
+  return message.parts.some(part => {
+    if (part.type !== "text" || !isRecord(part.metadata)) {
+      return false;
+    }
+
+    const magicCompact = part.metadata["magicCompact"];
+    if (!isRecord(magicCompact) || magicCompact["stats"] !== true) {
+      return false;
+    }
+
+    if (magicCompact["invalidatesProviderUsage"] === true) {
+      return true;
+    }
+
+    return (
+      part.text.startsWith("Magic Compaction #")
+      || part.text.startsWith("Magic Trim\n")
+    );
+  });
 }
 
 async function getAutoCompactBudget(

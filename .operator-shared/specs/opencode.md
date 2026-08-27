@@ -12,13 +12,14 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 ## Automatic Takeover
 
 - Setting OpenCode's `compaction.auto` to `false` explicitly transfers automatic compaction ownership to Magic Compact.
-- Before each ordinary user message is persisted, the `chat.message` hook estimates the stored session plus the pending message using local token counting.
+- Before each ordinary user message is sent, the `chat.message` hook reads the latest completed assistant usage that OpenCode persisted from the provider. Unfinished zero-usage rows are skipped.
 - The automatic threshold is `model context - max(model output limit, 49,152 tokens)`.
-- Automatic decisions never use provider usage stored on historical assistant messages because those values become stale after in-place pruning.
-- When the estimate reaches the threshold, the hook runs `/magic-compact` behavior with `N = 0` before allowing the pending message to continue.
+- Automatic decisions never estimate context size from transcript text or the pending message. If authoritative provider usage is unavailable, the hook does not make an automatic compaction decision.
+- Compaction and trim notices invalidate older provider usage. A stored usage record is trusted only after the latest invalidation marker; legacy plugin notices are recognized for already-compacted sessions.
+- When provider-reported usage reaches the threshold, or the latest assistant record contains a structured provider context-overflow error, the hook runs `/magic-compact` behavior with `N = 0` before allowing the pending message to continue.
 - Magic Compact's internal progress, boundary, and stats messages and temporary summarization sessions never recursively trigger automatic compaction.
 - Concurrent automatic checks for the same session share one in-flight operation.
-- After compaction, the hook recounts the session. If no turns were compacted or the request still exceeds the safe threshold, the pending request is stopped with an actionable error instead of being sent to the provider.
+- After compaction, the hook does not invent a replacement usage value. The next successful provider response becomes the new authoritative context snapshot. If no turns can be compacted, the pending request is stopped with an actionable error.
 - If native `compaction.auto` is omitted or `true`, automatic Magic Compact remains disabled and commands continue to work manually.
 
 `/magic-compact` and `/magic-trim` accept only a non-negative integer argument. `/magic-stats` accepts no arguments. Command handlers throw success, no-op, or validation messages so OpenCode does not continue sending the slash command to the LLM.
