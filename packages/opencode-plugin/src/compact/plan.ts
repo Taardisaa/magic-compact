@@ -64,7 +64,10 @@ export async function createTrimPlan(
   };
 }
 
-async function loadTurns(v2: V2Client, sessionID: string): Promise<Turn[]> {
+export async function loadTurns(
+  v2: V2Client,
+  sessionID: string,
+): Promise<Turn[]> {
   const messages: MessageWithParts[] = unwrap(
     await v2.session.messages({
       sessionID,

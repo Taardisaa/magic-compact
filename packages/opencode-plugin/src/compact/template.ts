@@ -33,17 +33,16 @@ ${buildXmlTemplate(turns, nextTurn)}
 
 - Summarize everything between one user message and the next
 - Keep your summaries short and direct
-  - Try to keep your summaries under 250 words whenever possible
-  - You may go over 250 words to preserve summary quality if the assistant turn was genuinely long
+  - Keep each summary under 120 words whenever possible
+  - Go over 120 words only when needed to preserve a critical decision, result, error, or unresolved next step
 - In your summary, include:
   - Relevant decisions and thought process, including specific plans if any was presented
   - Very brief bullet point summary of your workflow
   - Errors or bugs encountered + fixes, if any
   - Final results and summarized output to the user + next steps
-- All tool calls are preserved and automatically included with your summary
-  - Therefore, you **do not need to restate details about what tools you used or with what arguments**
-  - However, you include analysis of motivations for tool calls or specific findings from tool call results
-  - E.g. for file reads: What files contains what, what files are junk
+- Historical tool calls will be archived locally and removed from active model context after this summary succeeds
+  - Preserve important findings, changed files/configuration, command outcomes, and errors from tool calls
+  - Do not copy raw tool arguments or output
 - Do not mention this summarization process; your summaries should naturally replace the assistant's turn within the flow of the conversation
 </system>`;
 }
@@ -89,8 +88,8 @@ ${buildXmlTemplate(turns, nextTurn)}
 
 - Summarize everything the assistant did between each target user request and the next user request.
 - Preserve decisions, results, errors, fixes, relevant file state, and next steps.
-- Keep each summary under 250 words whenever possible.
-- Tool calls remain in the source session, so summarize their findings and motivation rather than copying arguments or raw output.
+- Keep each summary under 120 words whenever possible.
+- Historical tool calls will be archived locally and removed from active model context, so preserve their important findings and outcomes without copying raw arguments or output.
 - Your response must start with <summary> and end with </summary>.
 
 ## Prior batch context

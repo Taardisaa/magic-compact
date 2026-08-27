@@ -18,12 +18,71 @@ export function boundaryPartID(messageID: string): string {
   return `prt_-magic_boundary_${messageID}`;
 }
 
+export function toolArchivePartID(messageID: string): string {
+  return `prt_-magic_tool_archive_${messageID}`;
+}
+
+export function rollupArchivePartID(messageID: string): string {
+  return `prt_-magic_rollup_archive_${messageID}`;
+}
+
 export function summaryMetadata(): Record<string, unknown> {
   return {
     magicCompact: {
       summary: true,
     },
   };
+}
+
+export function toolArchiveMetadata(): Record<string, unknown> {
+  return {
+    magicCompact: {
+      toolArchive: true,
+    },
+  };
+}
+
+export function rollupSummaryMetadata(): Record<string, unknown> {
+  return {
+    magicCompact: {
+      summary: true,
+      rollup: true,
+    },
+  };
+}
+
+export function rollupArchiveMetadata(): Record<string, unknown> {
+  return {
+    magicCompact: {
+      rollupArchive: true,
+    },
+  };
+}
+
+export function rollupArchiveNotice(
+  summaryCount: number,
+  length: number,
+  contentID: string,
+): string {
+  return `<historical-summary-omission-notice>
+${summaryCount} detailed historical summary record(s) were replaced by the adjacent bounded rollup. Their exact text and archive pointers remain locally retrievable.
+
+Archived Length: ${length} characters
+Content ID: ${contentID}
+</historical-summary-omission-notice>`;
+}
+
+export function toolArchiveNotice(
+  toolCount: number,
+  length: number,
+  contentID: string,
+): string {
+  return `<tool-transcript-omission-notice>
+${toolCount} historical tool call(s) were removed from active context after their findings were summarized. The exact serialized tool transcript remains locally retrievable.
+
+Archived Length: ${length} characters
+Content ID: ${contentID}
+</tool-transcript-omission-notice>`;
 }
 
 export function outputOmissionNotice(

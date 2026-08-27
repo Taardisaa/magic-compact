@@ -13,7 +13,7 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 
 - Setting OpenCode's `compaction.auto` to `false` explicitly transfers automatic compaction ownership to Magic Compact.
 - Before each ordinary user message is sent, the `chat.message` hook reads the latest completed, positive assistant usage that OpenCode persisted from the provider. Unfinished and zero-usage rows are skipped; some OpenAI-compatible proxies persist rejected requests as completed zero-usage assistant rows without a structured error.
-- The automatic threshold is `model context - max(model output limit, 49,152 tokens)`.
+- The automatic threshold is exactly `floor(model context × 0.85)`.
 - Automatic decisions never estimate context size from transcript text or the pending message. If authoritative provider usage is unavailable, the hook does not make an automatic compaction decision.
 - Compaction and trim notices invalidate older provider usage. A stored usage record is trusted only after the latest invalidation marker; legacy plugin notices are recognized for already-compacted sessions.
 - When provider-reported usage reaches the threshold, or the latest assistant record contains a structured provider context-overflow error, the hook runs `/magic-compact` behavior with `N = 0` before allowing the pending message to continue.
@@ -54,11 +54,13 @@ OpenCode-specific runtime behavior. Shared plugin behavior lives in [`operator.m
 24. Delete the progress message in cleanup.
 25. Only after every summary succeeds, upsert deterministic summary text parts onto the first assistant message in each summarized turn.
 26. Inject the post-compaction boundary notice.
-27. Reload summarized turns, then prune summarized turns.
-28. Update current session metadata with `compactionCount`.
-29. Measure post-compaction tokens.
-30. Update stats and inject an ignored stats notice.
-31. Show a success toast.
+27. Reload the full session and sweep every already-summarized turn, including history before the latest boundary.
+28. Serialize each swept turn's complete tool parts into the local omission cache, replace them with one retrievable archive notice, and remove the active tool parts.
+29. If detailed summaries exceed 24, generate one bounded historical rollup for the oldest range while preserving the newest 16 detailed summaries. Archive the exact replaced summaries and their archive pointers locally.
+30. Update current session metadata with `compactionCount`.
+31. Measure post-compaction tokens.
+32. Update stats and inject an ignored stats notice.
+33. Show a success toast.
 
 ## Trim Flow (Experimental)
 
@@ -101,10 +103,12 @@ Known issues: We do not check for noops.
 
 ## Recompaction
 
-- Previously summarized turns are preserved as-is.
-- Recompaction starts at the latest boundary marker.
+- New per-turn summarization starts at the latest boundary marker; earlier turns are never redundantly summarized from raw transcript again.
+- After new summaries are committed, the pruning sweep revisits every summary-bearing turn across the complete session so historical tool structures cannot accumulate.
+- Detailed summaries are bounded: above 24 summaries, the oldest range is replaced by one historical rollup and the newest 16 remain detailed.
+- A later rollup may include the previous rollup, so repeated compaction converges to one bounded historical rollup plus a bounded detailed tail.
 - The boundary marker is a user text part with `metadata.magicCompact.boundary === true`.
-- Earlier turns before the latest boundary are outside the current compaction range.
+- Earlier turns before the latest boundary are outside the raw summarization range but remain eligible for pruning and rollup maintenance.
 
 ## Summarization
 
@@ -129,6 +133,9 @@ Known issues: We do not check for noops.
 - Each summary is written as a text part on the first assistant message in the summarized turn.
 - Summary parts use deterministic IDs: `prt_-magic_summary_${messageID}`.
 - Summary parts are marked with `metadata.magicCompact.summary === true`.
+- Per-turn summaries target at most 120 words unless critical state requires more.
+- Historical rollups target at most 1,200 words and have a 12,000-character hard cap.
+- Rollup prompts contain only prior summaries as inert JSON, run in fresh temporary sessions, and use the source model, agent, and variant.
 
 ## Boundary Notice
 
@@ -170,7 +177,7 @@ Known issues: We do not check for noops.
 
 - `countSessionTokens` counts persisted message part tokens locally plus estimated system prompt overhead.
 - The system prompt estimate uses the first assistant message with provider usage and the first user message text.
-- `getProviderTokens` reads positive provider-reported usage from the latest assistant message when available. Missing or zeroed usage, including failed context-overflow responses, falls back to local counting.
+- `getProviderTokens` scans backward for the latest positive provider-reported usage. Missing or zeroed usage, including failed context-overflow responses, is skipped; local counting is used only when no positive usage exists.
 
 ### Accounting
 
@@ -191,16 +198,20 @@ Known issues: We do not check for noops.
 
 ## Pruning
 
-- Pruning applies only to summarized turns after summary insertion and boundary injection.
+- Pruning sweeps every summary-bearing turn after summary insertion and boundary injection, independent of the latest compaction boundary.
 - Synthetic user text parts are deleted unless they are preserved OpenCode wrappers or reminders.
-- Summarized assistant messages keep summary parts and tool parts.
+- Every historical tool part in a summarized turn is serialized exactly into one session-local omission entry before active-context deletion.
+- Summarized assistant messages keep only summary parts and compact archive notices.
 - Other assistant parts are deleted.
 - Assistant messages with no remaining parts are deleted.
-- Only completed tool parts are pruned; pending, running, and error states are preserved.
+- Tool archive notices use deterministic IDs and retain the omission Content ID needed for exact local retrieval.
+- When detailed summaries exceed the rollup cap, replaced summary text and its archive notices are themselves serialized into a retrievable omission entry before deletion.
 - `/magic-trim` applies only the tool rules below; it does not delete other user or assistant parts.
-- Processed tool states are marked as trimmed, and later trim or compaction operations skip them.
+- `/magic-trim` marks processed completed tool states as trimmed and skips them on later trims.
 
 ## Tool Rules
+
+The following state-level rules apply to `/magic-trim` and to disposable summary-fork shrinking. Successful `/magic-compact` ultimately archives and removes whole historical tool parts from active context after their semantic results have been summarized.
 
 - `write`: omit large `input.content` and cache it.
 - `edit`: omit large `oldString` and `newString` together and cache once.

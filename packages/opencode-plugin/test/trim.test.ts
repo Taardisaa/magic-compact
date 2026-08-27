@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import type { Message, Part, ToolPart } from "@opencode-ai/sdk/v2";
+import type { Message, Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
 import type { V2Client } from "../src/api";
 import {
   createTrimPlan,
   type MessageWithParts,
   type Turn,
 } from "../src/compact/plan";
-import { trimToolParts } from "../src/compact/prune";
+import { pruneCompactedHistory, trimToolParts } from "../src/compact/prune";
 
 describe("magic trim", () => {
   test("preserves the requested assistant-turn tail", async () => {
@@ -70,6 +70,52 @@ describe("magic trim", () => {
     ).toBe(0);
     expect(updates).toBe(1);
   });
+
+  test("archives and removes tools from all summarized history", async () => {
+    const oldTool = readTool("tool_old", "old output");
+    oldTool.messageID = "ast_old";
+    const newTool = readTool("tool_new", "new output");
+    newTool.messageID = "ast_new";
+    const messages = [
+      message("usr_old", "user", []),
+      message("ast_old", "assistant", [summary("ast_old"), oldTool]),
+      message("usr_boundary", "user", [boundary("usr_boundary")]),
+      message("ast_new", "assistant", [summary("ast_new"), newTool]),
+    ];
+    const archived: string[] = [];
+    const deleted: string[] = [];
+    const v2 = {
+      session: {
+        messages: async () => ({ data: messages }),
+        deleteMessage: async () => ({ data: true }),
+      },
+      part: {
+        update: async (input: { part: Part }) => {
+          if (input.part.type === "text") {
+            archived.push(input.part.text);
+          }
+          return { data: input.part };
+        },
+        delete: async (input: { partID: string }) => {
+          deleted.push(input.partID);
+          return { data: true };
+        },
+      },
+    } as unknown as V2Client;
+    let nextID = 1;
+
+    await pruneCompactedHistory({
+      v2,
+      sessionID: "session",
+      allocateOmission: async () => `omitted-00${nextID++}`,
+    });
+
+    expect(deleted).toContain("tool_old");
+    expect(deleted).toContain("tool_new");
+    expect(archived).toHaveLength(2);
+    expect(archived[0]).toContain("omitted-001");
+    expect(archived[1]).toContain("omitted-002");
+  });
 });
 
 function message(
@@ -110,5 +156,29 @@ function completedTool(id: string, tool: string, output: string): ToolPart {
       metadata: {},
       time: { start: 1, end: 2 },
     },
+  };
+}
+
+function summary(messageID: string): TextPart {
+  return {
+    id: `summary_${messageID}`,
+    sessionID: "session",
+    messageID,
+    type: "text",
+    text: `Summary for ${messageID}`,
+    synthetic: true,
+    metadata: { magicCompact: { summary: true } },
+  };
+}
+
+function boundary(messageID: string): TextPart {
+  return {
+    id: `boundary_${messageID}`,
+    sessionID: "session",
+    messageID,
+    type: "text",
+    text: "boundary",
+    synthetic: true,
+    metadata: { magicCompact: { boundary: true } },
   };
 }

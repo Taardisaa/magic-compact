@@ -1,13 +1,21 @@
-import type { Part, ToolPart } from "@opencode-ai/sdk/v2";
+import type { Part, TextPart, ToolPart } from "@opencode-ai/sdk/v2";
 import { unwrap, type V2Client } from "../api";
-import { inputOmissionNotice, outputOmissionNotice } from "./constants";
+import {
+  inputOmissionNotice,
+  outputOmissionNotice,
+  toolArchiveMetadata,
+  toolArchiveNotice,
+  toolArchivePartID,
+} from "./constants";
 import type { MessageWithParts, Turn } from "./plan";
+import { loadTurns } from "./plan";
 import { allocateOmission } from "../storage/omission";
 import { isRecord, unwrapString } from "../util";
 
 type PruneContext = {
   v2: V2Client;
   sessionID: string;
+  allocateOmission?: typeof allocateOmission;
 };
 
 const DEFAULT_OUTPUT_DESCRIPTION =
@@ -21,6 +29,8 @@ export async function pruneSummarizedTurns(
   turns: Turn[],
 ): Promise<void> {
   for (const turn of turns) {
+    await archiveTurnTools(context, turn);
+
     for (const user of turn.user) {
       await pruneUserParts(context, user);
     }
@@ -29,6 +39,63 @@ export async function pruneSummarizedTurns(
       await pruneAssistantParts(context, assistant);
     }
   }
+}
+
+/**
+ * Revisit every already-summarized turn, including ranges before the latest
+ * compaction boundary. This keeps repeated compaction convergent instead of
+ * retaining an ever-growing tool-call skeleton forever.
+ */
+export async function pruneCompactedHistory(
+  context: PruneContext,
+): Promise<void> {
+  const turns = await loadTurns(context.v2, context.sessionID);
+  const compactedTurns = turns.filter(turn =>
+    turn.assistants.some(message => message.parts.some(isSummaryPart)),
+  );
+  await pruneSummarizedTurns(context, compactedTurns);
+}
+
+async function archiveTurnTools(
+  context: PruneContext,
+  turn: Turn,
+): Promise<void> {
+  const tools = turn.assistants.flatMap(message =>
+    message.parts.filter((part): part is ToolPart => part.type === "tool"),
+  );
+  if (tools.length === 0) {
+    return;
+  }
+
+  const target = turn.assistants.find(message =>
+    message.parts.some(isSummaryPart),
+  );
+  if (!target) {
+    throw new Error("Cannot archive tools for a turn without a summary part.");
+  }
+
+  const serialized = JSON.stringify(tools);
+  const contentID = await allocate(context, {
+    content: serialized,
+  });
+  const part: TextPart = {
+    id: toolArchivePartID(target.info.id),
+    sessionID: context.sessionID,
+    messageID: target.info.id,
+    type: "text",
+    text: toolArchiveNotice(tools.length, serialized.length, contentID),
+    synthetic: true,
+    metadata: toolArchiveMetadata(),
+  };
+
+  unwrap(
+    await context.v2.part.update({
+      sessionID: context.sessionID,
+      messageID: target.info.id,
+      partID: part.id,
+      part,
+    }),
+  );
 }
 
 export async function trimToolParts(
@@ -106,16 +173,27 @@ async function pruneAssistantParts(
   let keptParts = 0;
 
   for (const part of message.parts) {
-    // If is compaction summary, leave alone
-    if (isSummaryPart(part)) {
+    // Keep the compact semantic summary and the single retrievable archive
+    // pointer that replaces this turn's tool-call skeleton.
+    if (
+      isSummaryPart(part)
+      || isToolArchivePart(part)
+      || isRollupArchivePart(part)
+    ) {
       keptParts += 1;
       continue;
     }
 
-    // If it is a tool call, prune but keep
+    // Tool calls have already been serialized into the turn archive. Remove
+    // them entirely from active model context.
     if (part.type === "tool") {
-      await pruneToolPart(context, part);
-      keptParts += 1;
+      unwrap(
+        await context.v2.part.delete({
+          sessionID: context.sessionID,
+          messageID: message.info.id,
+          partID: part.id,
+        }),
+      );
       continue;
     }
 
@@ -266,7 +344,7 @@ async function applyInputOmissions(
   if (part.tool === "write") {
     const content = unwrapString(input["content"]);
     if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate(context, { content });
       input["content"] = "[Omitted]";
       return inputOmissionNotice(
         "File write contents omitted due to a compaction operation. If necessary, reread file to see current contents.",
@@ -279,7 +357,7 @@ async function applyInputOmissions(
   if (part.tool === "apply_patch") {
     const content = unwrapString(input["patchText"]);
     if (content && exceeds(content, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate(context, { content });
       input["patchText"] = "[Omitted]";
       return inputOmissionNotice(
         "Patch text omitted due to compaction operation. If necessary, reread files to see current contents.",
@@ -292,7 +370,7 @@ async function applyInputOmissions(
   if (part.tool === "bash") {
     const content = unwrapString(input["command"]);
     if (content && content.length > 1024) {
-      const contentID = await allocateOmission(context.sessionID, { content });
+      const contentID = await allocate(context, { content });
       input["command"] =
         `${content.slice(0, 512)}\n[REST OF COMMAND TRUNCATED]`;
       return inputOmissionNotice(
@@ -308,7 +386,7 @@ async function applyInputOmissions(
     const newString = unwrapString(input["newString"]);
     const combined = `${oldString}\n${newString}`;
     if (exceeds(combined, DEFAULT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, {
+      const contentID = await allocate(context, {
         content: combined,
       });
       input["oldString"] = "[Omitted]";
@@ -350,7 +428,7 @@ async function applyOutputOmissions(
   }
 
   if (part.tool === "read") {
-    const contentID = await allocateOmission(context.sessionID, {
+    const contentID = await allocate(context, {
       content: output,
     });
     part.state.output = outputOmissionNotice(
@@ -363,7 +441,7 @@ async function applyOutputOmissions(
 
   if (part.tool === "task") {
     if (exceeds(output, TASK_OUTPUT_LIMIT)) {
-      const contentID = await allocateOmission(context.sessionID, {
+      const contentID = await allocate(context, {
         content: output,
       });
       part.state.output = outputOmissionNotice(
@@ -379,7 +457,7 @@ async function applyOutputOmissions(
     return;
   }
 
-  const contentID = await allocateOmission(context.sessionID, {
+  const contentID = await allocate(context, {
     content: output,
   });
   part.state.output = outputOmissionNotice(
@@ -401,6 +479,34 @@ function isSummaryPart(part: Part): boolean {
 
   const magicCompact = metadata["magicCompact"];
   return isRecord(magicCompact) && magicCompact["summary"] === true;
+}
+
+function isToolArchivePart(part: Part): boolean {
+  if (part.type !== "text" || !isRecord(part.metadata)) {
+    return false;
+  }
+
+  const magicCompact = part.metadata["magicCompact"];
+  return isRecord(magicCompact) && magicCompact["toolArchive"] === true;
+}
+
+function isRollupArchivePart(part: Part): boolean {
+  if (part.type !== "text" || !isRecord(part.metadata)) {
+    return false;
+  }
+
+  const magicCompact = part.metadata["magicCompact"];
+  return isRecord(magicCompact) && magicCompact["rollupArchive"] === true;
+}
+
+function allocate(
+  context: PruneContext,
+  entry: Parameters<typeof allocateOmission>[1],
+): Promise<string> {
+  return (context.allocateOmission ?? allocateOmission)(
+    context.sessionID,
+    entry,
+  );
 }
 
 function isImportantSyntheticPart(part: Part): boolean {

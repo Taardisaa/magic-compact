@@ -10,13 +10,13 @@ import {
   injectProgressNotice,
   injectCompactStatsNotice,
   recordPruningStats,
-  reloadTurns,
   updateCompactionMetadata,
   updateProgressNotice,
 } from "./compact/session";
 import type { CompactProgressReporter } from "./compact/progress";
 import { createCompactionPlan } from "./compact/plan";
-import { pruneSummarizedTurns } from "./compact/prune";
+import { pruneCompactedHistory } from "./compact/prune";
+import { rollupCompactedSummaries } from "./compact/rollup";
 import { countSessionTokens, getProviderTokens } from "./stats/tokenize";
 
 export const COMPACT_SUCCESS = "Magic compaction successful.";
@@ -92,12 +92,8 @@ export async function executeMagicCompact(
     await injectPostCompactionNotice(v2, sessionID, compacted.nextTurn);
 
     // Prune messages & tool calls
-    const summarizedTurns = await reloadTurns(
-      v2,
-      sessionID,
-      compacted.summarizedTurns,
-    );
-    await pruneSummarizedTurns({ v2, sessionID }, summarizedTurns);
+    await pruneCompactedHistory({ v2, sessionID });
+    await rollupCompactedSummaries(v2, sourceSession, sessionID);
 
     await updateCompactionMetadata(v2, sourceSession, currentCompactionCount);
     const afterTokens = await countSessionTokens(v2, sessionID);

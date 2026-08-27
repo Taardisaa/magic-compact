@@ -84,7 +84,7 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 }
 ```
 
-安装 Magic Compact 后,该设置会启用请求前接管 hook。插件会在本地计算已存储会话和待发送用户消息,达到 `context - max(模型输出上限,49,152 tokens)` 时先运行 Magic Compact。它不会依赖原地修剪后仍残留在历史消息上的旧 provider token usage。省略该设置或使用 `true` 时,Magic Compact 保持手动模式,OpenCode 原生自动压缩继续生效。
+安装 Magic Compact 后,该设置会启用接管 hook。插件只使用 OpenCode 持久化的正数 provider usage,不猜测 transcript 大小,并在模型上下文上限的 85% 精确触发。provider-call 预检也会覆盖工具循环的自动续写,并在会话进入 idle 后立即执行压缩。省略该设置或使用 `true` 时,Magic Compact 保持手动模式,OpenCode 原生自动压缩继续生效。
 
 ### `/magic-compact`
 
@@ -96,6 +96,8 @@ NPM_CONFIG_MIN_RELEASE_AGE=0 opencode plugin magic-compact --global
 - OpenCode 的进度提示会在已验证的助手回合摘要完成时原地更新;分批或递归拆分时还会显示当前处理的回合范围。
 - 所有批次成功后才会原子写回摘要。若单个回合仍无法放入上下文,插件会安全停止并明确建议使用原生 `/compact`,不会部分修改会话。
 - 非空但格式错误的 XML 只会在全新的轻量会话中修复一次;提供商错误和空响应不会被当成格式问题重试。
+- 摘要成功后,完整的历史工具 part 会写入本地 omission 存储并从模型活跃上下文删除;其精确序列化 transcript 仍可通过 Content ID 取回。
+- 详细摘要有明确上限。超过 24 条时,最老的一段会合并为一条高密度历史 rollup,最近 16 条保持详细;被替换的摘要也会存入本地,可精确取回。
 
 示例:
 
@@ -185,7 +187,7 @@ OpenCode-DCP 是一个运行时上下文管理系统,会在模型请求时重写
 Magic Compact 提供:
 
 - 简单 — 一个命令,零配置。
-- 无损质量 — 逐回合的流程保持完整。所有用户命令都被保留。所有过去的工具调用都被保留。
+- 可回查历史 — 用户命令保留在会话中;被移除的工具 transcript 和被 rollup 的摘要细节仍保存在本地 omission 存储中。
 - 最大化 token 节省 — 整段对话通过一次请求完成摘要。长工具调用被积极修剪。
 - 无缓存搅动 — 压缩一次性完成且对缓存友好,而 DCP 可能在一次请求内多次使整段对话失效。
 - 零助手开销 — 没有要求助手压缩的提示注入。你的助手专注于它的任务。

@@ -9,7 +9,7 @@ import { executeMagicCompact } from "./magic-compact";
 import type { MessageWithParts } from "./compact/plan";
 import { isRecord } from "./util";
 
-export const DEFAULT_AUTO_COMPACT_BUFFER_TOKENS = 49_152;
+export const AUTO_COMPACT_THRESHOLD_RATIO = 0.85;
 
 type ModelSelection = UserMessage["model"];
 
@@ -30,7 +30,6 @@ type ProviderCallRequest = {
 };
 
 type AutoCompactOptions = {
-  bufferTokens?: number;
   compact?: typeof executeMagicCompact;
 };
 
@@ -53,12 +52,9 @@ export class AutoCompactController {
   private enabled = false;
   private readonly inFlight = new Map<string, Promise<void>>();
   private readonly compactAfterIdle = new Set<string>();
-  private readonly bufferTokens: number;
   private readonly compact: typeof executeMagicCompact;
 
   constructor(options: AutoCompactOptions = {}) {
-    this.bufferTokens =
-      options.bufferTokens ?? DEFAULT_AUTO_COMPACT_BUFFER_TOKENS;
     this.compact = options.compact ?? executeMagicCompact;
   }
 
@@ -110,7 +106,7 @@ export class AutoCompactController {
       return;
     }
 
-    const budget = budgetFromLimits(request.model.limit, this.bufferTokens);
+    const budget = budgetFromContext(request.model.limit.context);
     const messages = unwrap(
       await v2.session.messages({ sessionID: request.sessionID }),
     ) as MessageWithParts[];
@@ -201,11 +197,7 @@ export class AutoCompactController {
       return;
     }
 
-    const budget = await getAutoCompactBudget(
-      v2,
-      request.model,
-      this.bufferTokens,
-    );
+    const budget = await getAutoCompactBudget(v2, request.model);
     if (!budget) {
       return;
     }
@@ -348,7 +340,6 @@ function isContextMutationNotice(message: MessageWithParts): boolean {
 async function getAutoCompactBudget(
   v2: V2Client,
   selection: ModelSelection,
-  bufferTokens: number,
 ): Promise<AutoCompactBudget | null> {
   try {
     const providers = unwrap(await v2.provider.list());
@@ -361,20 +352,16 @@ async function getAutoCompactBudget(
       return null;
     }
 
-    return budgetFromLimits(model.limit, bufferTokens);
+    return budgetFromContext(context);
   } catch {
     return null;
   }
 }
 
-function budgetFromLimits(
-  limit: { context: number; output: number },
-  bufferTokens: number,
-): AutoCompactBudget {
-  const reserved = Math.max(bufferTokens, limit.output);
+function budgetFromContext(context: number): AutoCompactBudget {
   return {
-    context: limit.context,
-    threshold: Math.max(1, limit.context - reserved),
+    context,
+    threshold: Math.max(1, Math.floor(context * AUTO_COMPACT_THRESHOLD_RATIO)),
   };
 }
 

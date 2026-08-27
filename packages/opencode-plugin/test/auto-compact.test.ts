@@ -218,7 +218,6 @@ describe("automatic magic compact takeover", () => {
 
 function createController(runtime: ReturnType<typeof mockRuntime>) {
   return new AutoCompactController({
-    bufferTokens: 20,
     compact: runtime.compact,
   });
 }

@@ -32,6 +32,25 @@ describe("magic compact stats", () => {
     expect(await getProviderTokens(v2, "session")).toBe(165);
   });
 
+  test("skips a zeroed failed response and uses the latest positive usage", async () => {
+    const v2 = clientWithMessages([
+      assistantMessage({
+        input: 100,
+        output: 20,
+        reasoning: 5,
+        cache: { read: 30, write: 10 },
+      }),
+      assistantMessage({
+        input: 0,
+        output: 0,
+        reasoning: 0,
+        cache: { read: 0, write: 0 },
+      }),
+    ]);
+
+    expect(await getProviderTokens(v2, "session")).toBe(165);
+  });
+
   test("describes missing custom-model pricing without rejecting the model", () => {
     const message = statsMessage(
       1,

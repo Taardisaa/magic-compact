@@ -114,7 +114,7 @@ export async function getProviderTokens(
     }
 
     if (!message.info.tokens) {
-      return null;
+      continue;
     }
 
     const t = message.info.tokens;
@@ -125,7 +125,9 @@ export async function getProviderTokens(
     // an assistant message whose usage object is present but entirely zeroed.
     // Treat that as unavailable so callers use the local session estimate
     // instead of reporting a nonsensical 0 -> N token compaction.
-    return total > 0 ? total : null;
+    if (total > 0) {
+      return total;
+    }
   }
 
   return null;

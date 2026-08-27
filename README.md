@@ -82,7 +82,7 @@ To replace OpenCode's native automatic compaction with Magic Compact, explicitly
 }
 ```
 
-With Magic Compact installed, this setting enables its pre-request takeover hook. The hook counts the stored session and pending user message locally, then runs Magic Compact before the request when it reaches `context - max(model output, 49,152 tokens)`. It never relies on stale provider token usage left on messages after in-place pruning. Omitting the setting or using `true` leaves Magic Compact manual and keeps OpenCode's native automatic compaction active.
+With Magic Compact installed, this setting enables its takeover hook. It uses only positive provider usage persisted by OpenCode—never a transcript-size guess—and triggers at exactly 85% of the model context limit. A provider-call preflight also catches tool-loop continuations and queues compaction as soon as the session becomes idle. Omitting the setting or using `true` leaves Magic Compact manual and keeps OpenCode's native automatic compaction active.
 
 ### `/magic-compact`
 
@@ -94,6 +94,8 @@ To compact, run `/magic-compact [N]` with an optional argument indicating how ma
 - The OpenCode progress notice updates in place as validated assistant-turn summaries finish, including the active turn range when batching or recursively splitting.
 - Batch summaries are applied atomically only after every batch succeeds. An isolated turn that cannot fit stops with an actionable native `/compact` fallback instead of partially modifying the conversation.
 - Malformed non-empty XML is repaired once in a fresh minimal session; provider errors and empty responses are not retried as formatting problems.
+- After a summary succeeds, complete historical tool parts are archived in local omission storage and removed from active model context. Their exact serialized transcript remains retrievable by Content ID.
+- Detailed summaries are bounded. When more than 24 exist, the oldest range becomes one dense historical rollup while the newest 16 stay detailed; the replaced summaries are archived locally for exact retrieval.
 
 Examples:
 
@@ -183,7 +185,7 @@ OpenCode-DCP is a runtime context management system that rewrites messages when 
 Magic Compact Offers:
 
 - Simplicity — One command, zero configuration.
-- Lossless quality — Turn-by-turn flow stays intact. All user commands are preserved. All past tool calls are preserved.
+- Retrievable history — User commands remain in the session, while removed tool transcripts and rolled-up summary detail remain available in local omission storage.
 - Maximum token savings — The entire conversation is summarized with one request. Long tool calls are aggressively pruned.
 - No cache churn — Compaction happens once and is cache friendly, whereas DCP may invalidate entire conversations multiple times within one request.
 - Zero assistant overhead — No prompt injections asking the assistant to compact. Your assistant stay focused on its task.
